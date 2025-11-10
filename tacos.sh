@@ -31,6 +31,8 @@ configure() {
     fi
 
     echo "[TACOS] Configuring project..."
+    echo "[TACOS] Build type: $build_type"
+    echo "[TACOS] Tests: $test_flag"
     cmake -S "$PROJECT_DIR" \
         -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE="$build_type" \
@@ -39,12 +41,12 @@ configure() {
 
 build() {
     echo "[TACOS] Building project (with $THREADS threads)..."
-    cmake --build "$BUILD_DIR" --parallel "$THREADS"
+    cmake --build "$BUILD_DIR" --parallel "$THREADS" #--config Release
 }
 
 run() {
     echo "[TACOS] Running TACOS..."
-    "$BUILD_DIR/bin/tacos" "$@"
+    "$BUILD_DIR/bin/Debug/tacos" "$@"
 }
 
 test() {
