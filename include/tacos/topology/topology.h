@@ -84,6 +84,16 @@ class Topology {
     /// @brief Total count of switches registered in this topology
     [[nodiscard]] int switchesCount() const noexcept { return switchesCount_; }
 
+    /// @brief Get total number of logical connections (links) in the topology
+    /// @return Total number of directed logical links between NPUs
+    [[nodiscard]] int linksCount() const noexcept;
+
+    /// @brief Get total number of physical links in the topology
+    /// For switch-based topologies, this counts actual physical links (GPU<->Switch)
+    /// For direct topologies, this equals linksCount()
+    /// @return Total number of physical directed links
+    [[nodiscard]] int physicalLinksCount() const noexcept;
+
     /// @brief Upper bound on simultaneous hyper-edges through a switch
     [[nodiscard]] int switchParallelLimit(SwitchID sid) const noexcept;
 

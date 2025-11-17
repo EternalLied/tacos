@@ -33,6 +33,14 @@ int main() {
 
     const auto npusCount = topology.npusCount();
     std::cout << "NPUs count: " << npusCount << std::endl;
+    
+    // print link statistics
+    const auto logicalLinks = topology.linksCount();
+    const auto physicalLinks = topology.physicalLinksCount();
+    const auto switchCount = topology.switchesCount();
+    std::cout << "Logical links (GPU-to-GPU): " << logicalLinks << std::endl;
+    std::cout << "Physical links (actual): " << physicalLinks << std::endl;
+    std::cout << "Switches count: " << switchCount << std::endl;
 
     // create collective
     const Collective::ChunkSize outputBufferSize = 12 * (1 << 20);  // 12 MiB

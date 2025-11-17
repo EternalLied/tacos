@@ -7,6 +7,8 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 *******************************************************************************/
 
 #include <cassert>
+#include <algorithm>
+#include <vector>
 #include <tacos/topology/topology.h>
 
 using namespace tacos;
@@ -90,6 +92,60 @@ int Topology::npusCount() const noexcept {
     assert(npusCount_ > 0);
 
     return npusCount_;
+}
+
+int Topology::linksCount() const noexcept {
+    int count = 0;
+    for (int i = 0; i < npusCount_; ++i) {
+        for (int j = 0; j < npusCount_; ++j) {
+            if (connected_[i][j]) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+int Topology::physicalLinksCount() const noexcept {
+    // If there are switches, count physical GPU<->Switch links
+    if (switchesCount_ > 0) {
+        int physicalLinks = 0;
+        // For each switch, count the number of GPUs connected to it
+        // Each GPU has 2 physical links per switch: GPU->Switch and Switch->GPU
+        for (int sid = 0; sid < switchesCount_; ++sid) {
+            int portsConnected = 0;
+            // Count how many GPUs are connected via this switch
+            for (int i = 0; i < npusCount_; ++i) {
+                for (int j = 0; j < npusCount_; ++j) {
+                    if (i != j && viaSwitchId_[i][j] == sid) {
+                        portsConnected = std::max(portsConnected, i + 1);
+                        portsConnected = std::max(portsConnected, j + 1);
+                    }
+                }
+            }
+            // Each connected GPU has bidirectional link with switch
+            // But we need to count actual unique GPUs connected to this switch
+            std::vector<bool> connectedGpus(npusCount_, false);
+            for (int i = 0; i < npusCount_; ++i) {
+                for (int j = 0; j < npusCount_; ++j) {
+                    if (i != j && viaSwitchId_[i][j] == sid) {
+                        connectedGpus[i] = true;
+                        connectedGpus[j] = true;
+                    }
+                }
+            }
+            int gpuCount = 0;
+            for (int i = 0; i < npusCount_; ++i) {
+                if (connectedGpus[i]) ++gpuCount;
+            }
+            // Each GPU has 2 directed links with the switch (up and down)
+            physicalLinks += gpuCount * 2;
+        }
+        return physicalLinks;
+    }
+    
+    // No switches: physical links = logical links (direct connections)
+    return linksCount();
 }
 
 // ===== Switch-aware (TE-CCL style) impl =====
