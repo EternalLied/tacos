@@ -14,6 +14,8 @@ add_library(tacos
     topology/torus_2d.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/torus_2d.h
     topology/torus_3d.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/torus_3d.h
     topology/hypercube_3d.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/hypercube_3d.h
+    topology/switch_clique.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/switch_clique.h
+
     collective/collective.cpp ${CMAKE_SOURCE_DIR}/include/tacos/collective/collective.h
     collective/all_gather.cpp ${CMAKE_SOURCE_DIR}/include/tacos/collective/all_gather.h
     event_queue/event_queue.cpp ${CMAKE_SOURCE_DIR}/include/tacos/event_queue/event_queue.h

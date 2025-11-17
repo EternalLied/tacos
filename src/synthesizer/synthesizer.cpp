@@ -6,9 +6,11 @@ Copyright (c) 2022-2025 Intel Corporation
 Copyright (c) 2022-2025 Georgia Institute of Technology
 *******************************************************************************/
 
+#include <iostream>
 #include <cassert>
 #include <limits>
 #include <tacos/synthesizer/synthesizer.h>
+#include "log.h"
 
 using namespace tacos;
 
@@ -30,6 +32,8 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
     while (!eventQueue_.empty()) {
         // get current event time
         currentTime_ = eventQueue_.pop();
+        DebugLog(std::cout << "[TacosEvent]" << std::endl);
+        DebugLog(std::cout << "At Time: " << currentTime_ << std::endl);
 
         // first, filter out unsatisfied postconditions
         // this is required when choosing the chunk replacement candidates
@@ -39,7 +43,15 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
         // then, expand the TEN
         // this method will also process and update the arrival of chunks
         // at the current timestep, and will change the unsatisfied postconditions
-        expandTenTimestep_(&postconditionMap);
+        // and return the number of replacements performed
+        const auto [replacedCount, discardedCount] = expandTenTimestep_(&postconditionMap);
+        DebugLog(std::cout << "Replaced: " << replacedCount << std::endl);
+        DebugLog(std::cout << "Discarded: " << discardedCount << std::endl);
+
+        // count total number of unsatisfied chunk requests across all destinations
+        auto unsatisfiedCount = 0;
+        for (const auto &kv : postconditionMap) unsatisfiedCount += static_cast<int>(kv.second.size());
+        DebugLog(std::cout << "unsatisfied postconditions: " << unsatisfiedCount << std::endl);
 
         // after the expansion of the TEN, check if there are any unsatisfied postconditions
         auto postcondition = shufflePostcondition_(postconditionMap);
@@ -51,10 +63,17 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
             continue;
         }
 
+        auto successfulMatchingCount = 0;
+
         // for all unsatisfied postconditions, run link-chunk matching
         for (const auto [chunk, dest] : postcondition) {
-            linkChunkMatching_(chunk, dest);
+            if (linkChunkMatching_(chunk, dest)) {
+                ++successfulMatchingCount;
+            }
         }
+
+        DebugLog(std::cout << "Scheduled: " << successfulMatchingCount << std::endl);
+        DebugLog(std::cout << std::endl);
     }
 
     // all matching has been finished
@@ -126,7 +145,7 @@ std::vector<Synthesizer::Condition> Synthesizer::shufflePostcondition_(
     return postcondition;
 }
 
-void Synthesizer::expandTenTimestep_(PostconditionMap* const postconditionMap) noexcept {
+std::pair<int, int> Synthesizer::expandTenTimestep_(PostconditionMap* const postconditionMap) noexcept {
     // first, expand the TEN structure
     ten_->timestep(currentTime_);
 
@@ -134,6 +153,9 @@ void Synthesizer::expandTenTimestep_(PostconditionMap* const postconditionMap) n
     // e.g., chunk arrival or replacement
     // so that we can update the collective time
     auto eventHappened = false;
+
+    int replacedCount = 0;
+    int discardedCount = 0;
 
     // for every src-dest pairs
     for (auto src = 0; src < npusCount; src++) {
@@ -168,11 +190,13 @@ void Synthesizer::expandTenTimestep_(PostconditionMap* const postconditionMap) n
                     // no replacement candidate found
                     // just mark this TEN link as available and skip
                     ten_->transferFinished(src, dest);
+                    ++discardedCount;
                     continue;
                 }
 
                 // replacement candidate found
                 chunk = replacementChunk.value();
+                ++replacedCount;
             }
 
             // a meaningful chunk (regardless of replacement) has arrived at dest
@@ -200,6 +224,8 @@ void Synthesizer::expandTenTimestep_(PostconditionMap* const postconditionMap) n
         // update collective time to current time
         collectiveTime_ = currentTime_;
     }
+
+    return {replacedCount, discardedCount};
 }
 
 std::optional<Synthesizer::ChunkID> Synthesizer::findReplacementChunk_(
@@ -239,7 +265,7 @@ std::optional<Synthesizer::ChunkID> Synthesizer::findReplacementChunk_(
     return candidates[idx];
 }
 
-void Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexcept {
+bool Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexcept {
     // backtrack source NPUs
     auto sources = ten_->backtrack(dest);
 
@@ -276,7 +302,7 @@ void Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noex
 
     // if candidates are empty, no match can be made
     if (candidates.empty()) {
-        return;
+        return false;
     }
 
     // randomly shuffle and select one source NPU to make link-chunk match
@@ -288,6 +314,8 @@ void Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noex
 
     // schedule an event when the matched chunk arrives
     eventQueue_.schedule(arrivalTime);
+
+    return true;
 }
 
 bool Synthesizer::isEqual(const Time lhs, const Time rhs) noexcept {

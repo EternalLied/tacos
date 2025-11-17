@@ -30,6 +30,8 @@ configure() {
         build_type="Debug"
     fi
 
+    # local build_type="Debug"
+
     echo "[TACOS] Configuring project..."
     echo "[TACOS] Build type: $build_type"
     echo "[TACOS] Tests: $test_flag"

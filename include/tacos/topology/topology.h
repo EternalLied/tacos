@@ -11,9 +11,15 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <cstdint>
 #include <tacos/event_queue/event_queue.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tacos {
+
+  /// @brief Switch identifier used by hyper-edge modeling
+  using SwitchID = int;
+
+  // NOTE: npusCount() counts only GPUs; switches are not counted as NPUs.
 
 class Topology {
   public:
@@ -59,6 +65,34 @@ class Topology {
     /// @return true if a link exists, false otherwise
     [[nodiscard]] bool connected(NpuID src, NpuID dest) const noexcept;
 
+    // ===== Switch-aware (TE-CCL style) APIs =====
+    /// @brief Register a switch with a set of GPU ports and create GPU->GPU hyper-edges via this switch.
+    ///        Each pair (u,v) in ports gets a synthetic link whose bandwidth equals uplinkBandwidth
+    ///        and latency equals (gpu2swLatency + sw2gpuLatency). Direct links (if any) are kept.
+    /// @param ports             GPUs attached to this switch (NPU IDs)
+    /// @param uplinkBandwidth   Per-port bandwidth (GiB/sec)
+    /// @param gpu2swLatency     GPU->Switch latency (us)
+    /// @param sw2gpuLatency     Switch->GPU latency (us)
+    /// @param maxParallelEdges  Optional cap on #simultaneous hyper-edges through this switch
+    /// @return SwitchID
+    SwitchID addSwitchUniform(const std::vector<NpuID>& ports,
+                              Bandwidth uplinkBandwidth,
+                              Latency gpu2swLatency,
+                              Latency sw2gpuLatency,
+                              int maxParallelEdges = -1) noexcept;
+
+    /// @brief Total count of switches registered in this topology
+    [[nodiscard]] int switchesCount() const noexcept { return switchesCount_; }
+
+    /// @brief Upper bound on simultaneous hyper-edges through a switch
+    [[nodiscard]] int switchParallelLimit(SwitchID sid) const noexcept;
+
+    /// @brief Whether src->dest is a synthetic hyper-edge via some switch
+    [[nodiscard]] bool isViaSwitch(NpuID src, NpuID dest) const noexcept;
+
+    /// @brief SwitchID for the hyper-edge (src,dst); -1 if not via switch
+    [[nodiscard]] int viaSwitchId(NpuID src, NpuID dest) const noexcept;
+
   protected:
     /// @brief number of NPUs in the topology
     int npusCount_ = -1;
@@ -91,5 +125,16 @@ class Topology {
 
     /// @brief set of NPUs that can send a chunk to a given NPU
     std::unordered_map<NpuID, std::vector<NpuID>> backtrackMap_ = {};
+
+    // ===== Switch-aware (TE-CCL style) data =====
+    /// @brief number of registered switches
+    int switchesCount_ = 0;
+
+    /// @brief hyper-edge switch id: -1 if not via switch
+    std::vector<std::vector<int>> viaSwitchId_ = {};
+
+    /// @brief per-switch concurrent hyper-edge cap
+    std::vector<int> switchMaxParallel_ = {};
+
 };
 }  // namespace tacos

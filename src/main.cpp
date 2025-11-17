@@ -11,6 +11,8 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <tacos/event_queue/timer.h>
 #include <tacos/synthesizer/synthesizer.h>
 #include <tacos/topology/mesh_2d.h>
+#include <tacos/topology/switch_clique.h>
+#include "log.h"
 
 using namespace tacos;
 
@@ -26,19 +28,22 @@ int main() {
     const auto latency = 0.5;  // microseconds (us)
     const auto bandwidth = 50;  // GiB/sec
 
-    const auto topology = Mesh2D(width, height, bandwidth, latency);
+    // const auto topology = Mesh2D(width, height, bandwidth, latency);
+    const auto topology = SwitchClique(/*npus*/8, /*BW*/50.0, /*α_g2s*/0.7, /*α_s2g*/0.7);
+
     const auto npusCount = topology.npusCount();
     std::cout << "NPUs count: " << npusCount << std::endl;
 
     // create collective
     const Collective::ChunkSize outputBufferSize = 12 * (1 << 20);  // 12 MiB
-    const auto collectivesCount = 3;  // 3 initial chunks per each NPU
+    const auto collectivesCount = 1;  // initial chunks per each NPU
 
     const auto collective = AllGather(npusCount, collectivesCount);
     const auto chunkSize = outputBufferSize / (npusCount * collectivesCount);
     const auto chunksCount = collective.chunksCount();
     std::cout << "Chunks count: " << chunksCount << std::endl;
     std::cout << "Each chunk size: " << chunkSize << " bytes" << std::endl;
+    DebugLog(std::cout << std::endl);
 
     // create timer
     auto synthesizerTimer = Timer();

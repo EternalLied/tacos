@@ -102,6 +102,19 @@ class TimeExpandedNetwork {
     /// @brief link transfer time of a chunk using alpha-beta model (in microseconds)
     std::vector<std::vector<Time>> linkTransferTimes_ = {};
 
+    // ===== Switch-aware (TE-CCL style) data =====
+    /// @brief hyper-edge switch id for link src->dest, -1 if not via switch
+    std::vector<std::vector<int>> viaSwitchId_ = {};
+
+    /// @brief per-switch active concurrent hyper-edges
+    std::vector<int> switchActive_ = {};
+
+    /// @brief per-switch cap on concurrent hyper-edges
+    std::vector<int> switchMaxParallel_ = {};
+
+    /// @brief helper: whether a link is constrained by a switch and still under cap
+    [[nodiscard]] bool switchCapOk_(NpuID src, NpuID dest) const noexcept;
+
     /// @brief Set the chunk size for the alpha-beta model
     /// @param chunkSize chunk size in bytes
     void computeLinkTimes_(ChunkSize chunkSize) noexcept;

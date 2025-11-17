@@ -11,6 +11,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <utility>
 #include <optional>
 #include <random>
 #include <set>
@@ -107,7 +108,9 @@ class Synthesizer {
     /// at the designated destination NPUs, check the replacement opportunities,
     /// and update the chunkMap_ accordingly.
     /// @param postconditionMap map of unsatisfied postconditions
-    void expandTenTimestep_(PostconditionMap* postconditionMap) noexcept;
+  /// @brief Expand the TEN for the current timestep and return statistics
+  /// @return pair: <replacements_performed, discarded_transfers>
+  [[nodiscard]] std::pair<int, int> expandTenTimestep_(PostconditionMap* postconditionMap) noexcept;
 
     /// @brief Find a replacement candidate for a matched link-chunk transfer.
     /// @details For heterogeneous networks, a chunk may have arrived the destination NPU
@@ -129,7 +132,8 @@ class Synthesizer {
     /// as occupied with transferring the chunk
     /// @param chunk chunk ID to transfer
     /// @param dest destination NPU ID
-    void linkChunkMatching_(ChunkID chunk, NpuID dest) noexcept;
+  // return true if a link-chunk matching was scheduled
+  bool linkChunkMatching_(ChunkID chunk, NpuID dest) noexcept;
 
     /// @brief Compare lhs and rhs Time values for equality
     /// @param lhs Time value
