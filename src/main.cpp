@@ -12,6 +12,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <tacos/synthesizer/synthesizer.h>
 #include <tacos/topology/mesh_2d.h>
 #include <tacos/topology/switch_clique.h>
+#include <tacos/topology/multichassis_presets.h>
 #include "log.h"
 
 using namespace tacos;
@@ -28,11 +29,40 @@ int main() {
     const auto latency = 0.5;  // microseconds (us)
     const auto bandwidth = 50;  // GiB/sec
 
-    // const auto topology = Mesh2D(width, height, bandwidth, latency);
-    const auto topology = SwitchClique(/*npus*/8, /*BW*/50.0, /*α_g2s*/0.7, /*α_s2g*/0.7);
+    const auto mesh2d = Mesh2D(width, height, bandwidth, latency);
+    const auto switch_clique = SwitchClique(/*npus*/8, /*BW*/50.0, /*α_g2s*/0.7, /*α_s2g*/0.7);
 
+    tacos::Topology DGX1_1;
+    tacos::BuildDGX1_SingleChassis(DGX1_1, /*bw_gbps*/125.0, /*alpha_us*/0.35, /*allow_copy*/false);
+
+    tacos::Topology DGX2_2;
+    tacos::BuildDGX2_TwoChassis(DGX2_2, /*allow_copy*/false);
+
+    tacos::Topology NDv2_2;
+    tacos::BuildNDv2_FourChassis(NDv2_2, /*allow_copy*/false);
+
+    tacos::Topology NDv2_4;
+    tacos::BuildNDv2_FourChassis(NDv2_4, /*allow_copy*/false);
+
+    tacos::Topology AMD_2;
+    tacos::BuildAMD_MI250_2Chassis(AMD_2, /*allow_copy*/false);
+
+    tacos::Topology AMD_4;
+    tacos::BuildAMD_MI250_4Chassis(AMD_4, /*allow_copy*/false);
+
+    const auto topology = mesh2d;
     const auto npusCount = topology.npusCount();
     std::cout << "NPUs count: " << npusCount << std::endl;
+
+    // print link statistics
+    const auto totalLinks = topology.physLinksCount();
+    std::cout << "Total physical links: " << totalLinks << std::endl;
+    
+    const auto [d2d, d2s, s2d, s2s] = topology.getLinkStatistics();
+    std::cout << "  Device-to-Device links: " << d2d << std::endl;
+    std::cout << "  Device-to-Switch links: " << d2s << std::endl;
+    std::cout << "  Switch-to-Device links: " << s2d << std::endl;
+    std::cout << "  Switch-to-Switch links: " << s2s << std::endl;
 
     // create collective
     const Collective::ChunkSize outputBufferSize = 12 * (1 << 20);  // 12 MiB

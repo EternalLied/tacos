@@ -21,24 +21,31 @@ Mesh2D::Mesh2D(const int width,
     assert(bandwidth > 0);
     assert(latency >= 0);
 
-    // compute NPUs count
+    // Set NPUs count
     setNpusCount_(width * height);
 
-    // connect x-axis wise
+    // Add physical links for x-axis connections (horizontal)
     for (auto row = 0; row < height; ++row) {
         for (auto col = 0; col < (width - 1); ++col) {
             const auto src = (row * width) + col;
             const auto dest = src + 1;
-            connect_(src, dest, bandwidth, latency, true);
+            // Bidirectional links using the new API
+            addPhysLink(deviceNode(src), deviceNode(dest), bandwidth, latency);
+            addPhysLink(deviceNode(dest), deviceNode(src), bandwidth, latency);
         }
     }
 
-    // connect y-axis wise
+    // Add physical links for y-axis connections (vertical)
     for (auto row = 0; row < (height - 1); ++row) {
         for (auto col = 0; col < width; ++col) {
             const auto src = (row * width) + col;
             const auto dest = src + width;
-            connect_(src, dest, bandwidth, latency, true);
+            // Bidirectional links using the new API
+            addPhysLink(deviceNode(src), deviceNode(dest), bandwidth, latency);
+            addPhysLink(deviceNode(dest), deviceNode(src), bandwidth, latency);
         }
     }
+
+    // Finalize reachability to compute GPU->GPU paths via BFS
+    finalizeReachability_();
 }

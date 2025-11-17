@@ -12,6 +12,9 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <tacos/collective/collective.h>
 #include <tacos/topology/topology.h>
 #include <unordered_set>
+#include <unordered_map>
+#include <utility>
+#include <limits>
 
 namespace tacos {
 
@@ -87,6 +90,7 @@ class TimeExpandedNetwork {
 
     /// @brief number of NPUs in the topology
     int npusCount_ = -1;
+    int totalNodes_ = 0; // devices + switches
 
     /// @brief true if src-dest link is available at the current timestep
     std::vector<std::vector<bool>> available_;
@@ -102,18 +106,49 @@ class TimeExpandedNetwork {
     /// @brief link transfer time of a chunk using alpha-beta model (in microseconds)
     std::vector<std::vector<Time>> linkTransferTimes_ = {};
 
-    // ===== Switch-aware (TE-CCL style) data =====
-    /// @brief hyper-edge switch id for link src->dest, -1 if not via switch
-    std::vector<std::vector<int>> viaSwitchId_ = {};
+    // ===== Multi-switch physical resources =====
+    struct EdgeKey { int u; int v; };
+    // busy-until on physical directed edges (device/switch graph)
+    std::vector<std::vector<Time>> edgeBusyUntil_; // sized [totalNodes_][totalNodes_], -1 if no edge
+    std::vector<std::vector<Time>> edgeDelta_;     // per-edge α+β·n (μs); -1 if no edge
+    std::vector<std::vector<char>> hasEdge_;       // quick check
 
-    /// @brief per-switch active concurrent hyper-edges
-    std::vector<int> switchActive_ = {};
+    // per-switch in/out concurrent usage calendars: intervals [start,end)
+    struct Interval { Time s, e; };
+    std::vector<std::vector<Interval>> swInUse_;   // [sid] list of intervals
+    std::vector<std::vector<Interval>> swOutUse_;  // [sid] list of intervals
+    std::vector<int> swInCap_;   // resolved caps
+    std::vector<int> swOutCap_;
+    std::vector<char> swAllowCopy_;
 
-    /// @brief per-switch cap on concurrent hyper-edges
-    std::vector<int> switchMaxParallel_ = {};
+    // precomputed shortest route for each GPU pair at current chunkSize
+    struct Route {
+      std::vector<int> nodes;     // node indices u->...->v
+      std::vector<Time> deltas;   // per-edge Δ
+      Time total = 0;
+    };
+    std::vector<std::vector<Route>> routes_; // [srcGPU][dstGPU]
 
-    /// @brief helper: whether a link is constrained by a switch and still under cap
-    [[nodiscard]] bool switchCapOk_(NpuID src, NpuID dest) const noexcept;
+    // helpers
+    void computeEdgeTimes_(ChunkSize chunkSize) noexcept;
+    void computeRoutes_(ChunkSize chunkSize) noexcept;
+    [[nodiscard]] bool canReserveRoute_(const Route& r, Time t0) const noexcept;
+    void reserveRoute_(const Route& r, Time t0) noexcept;
+    [[nodiscard]] bool swCapOkAt_(int sid, Time s, Time e, bool isIn) const noexcept;
+    void swReserve_(int sid, Time s, Time e, bool isIn) noexcept;
+
+    // // ===== Switch-aware (TE-CCL style) data =====
+    // /// @brief hyper-edge switch id for link src->dest, -1 if not via switch
+    // std::vector<std::vector<int>> viaSwitchId_ = {};
+
+    // /// @brief per-switch active concurrent hyper-edges
+    // std::vector<int> switchActive_ = {};
+
+    // /// @brief per-switch cap on concurrent hyper-edges
+    // std::vector<int> switchMaxParallel_ = {};
+
+    // /// @brief helper: whether a link is constrained by a switch and still under cap
+    // [[nodiscard]] bool switchCapOk_(NpuID src, NpuID dest) const noexcept;
 
     /// @brief Set the chunk size for the alpha-beta model
     /// @param chunkSize chunk size in bytes

@@ -17,6 +17,7 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     : topology_(topology) {
     assert(chunkSize > 0);
     npusCount_ = topology_.npusCount();
+    totalNodes_ = topology_.totalNodes();
 
     // initialize TEN lists
     linkBusyUntil_ = decltype(linkBusyUntil_)(npusCount_, std::vector<Time>(npusCount_, -1));
@@ -25,17 +26,42 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     linkTransferTimes_ =
         decltype(linkTransferTimes_)(npusCount_, std::vector<Time>(npusCount_, -1));
 
-    viaSwitchId_.assign(npusCount_, std::vector<int>(npusCount_, -1));
-    // initialize switch caps
-    const int swCount = topology_.switchesCount();
-    switchActive_.assign(swCount, 0);
-    switchMaxParallel_.assign(swCount, 0);
-    for (int sid = 0; sid < swCount; ++sid) {
-        switchMaxParallel_[sid] = topology_.switchParallelLimit(sid);
-    }
+    // viaSwitchId_.assign(npusCount_, std::vector<int>(npusCount_, -1));
+    // // initialize switch caps
+    // const int swCount = topology_.switchesCount();
+    // switchActive_.assign(swCount, 0);
+    // switchMaxParallel_.assign(swCount, 0);
+    // for (int sid = 0; sid < swCount; ++sid) {
+    //     switchMaxParallel_[sid] = topology_.switchParallelLimit(sid);
+    // }
 
-    // calculate link transfer times
-    computeLinkTimes_(chunkSize);
+    // // calculate link transfer times
+    // computeLinkTimes_(chunkSize);
+
+    // physical graph resources
+    edgeBusyUntil_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
+    edgeDelta_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
+    hasEdge_.assign(totalNodes_, std::vector<char>(totalNodes_, 0));
+
+    // per-switch caps & calendars
+    swInCap_.assign(topology_.switchesCount(), 0);
+    swOutCap_.assign(topology_.switchesCount(), 0);
+    swAllowCopy_.assign(topology_.switchesCount(), 0);
+    for (int sid = 0; sid < topology_.switchesCount(); ++sid) {
+        swInCap_[sid] = topology_.switchInCapResolved(sid);
+        swOutCap_[sid] = topology_.switchOutCapResolved(sid);
+        swAllowCopy_[sid] = topology_.switchAt(sid).allowCopy ? 1 : 0;
+    }
+    swInUse_.assign(topology_.switchesCount(), {});
+    swOutUse_.assign(topology_.switchesCount(), {});
+
+    // per-edge Δ & GPU->GPU最短路
+    computeEdgeTimes_(chunkSize);
+    computeRoutes_(chunkSize);
+
+    for (int u = 0; u < npusCount_; ++u)
+      for (int v = 0; v < npusCount_; ++v)
+        available_[u][v] = topology_.connected(u, v);
 }
 
 bool TimeExpandedNetwork::available(const NpuID src, const NpuID dest) const noexcept {
@@ -53,18 +79,28 @@ std::unordered_set<TimeExpandedNetwork::NpuID> TimeExpandedNetwork::backtrack(
     // list of available source NPUs
     auto sources = std::unordered_set<NpuID>();
 
-    // filter the available sources from the topology backtracking
+    // filter the available sources from the topology backtracking + route feasibility
     for (const auto src : topology_.backtrack(dest)) {
-        if (available_[src][dest]) {
-
-            // If link goes via a switch, enforce switch concurrent-cap
-            if (viaSwitchId_[src][dest] >= 0) {
-                if (!switchCapOk_(src, dest)) continue;
-            }
-
+        if (!available_[src][dest]) continue; // gpu-level busy
+        const auto& r = routes_[src][dest];
+        if (r.nodes.empty()) continue;
+        if (canReserveRoute_(r, currentTime_)) {
             sources.insert(src);
         }
     }
+
+    // // filter the available sources from the topology backtracking
+    // for (const auto src : topology_.backtrack(dest)) {
+    //     if (available_[src][dest]) {
+
+    //         // If link goes via a switch, enforce switch concurrent-cap
+    //         if (viaSwitchId_[src][dest] >= 0) {
+    //             if (!switchCapOk_(src, dest)) continue;
+    //         }
+
+    //         sources.insert(src);
+    //     }
+    // }
 
     return sources;
 }
@@ -113,18 +149,26 @@ void TimeExpandedNetwork::transferChunk(const NpuID src,
     assert(available_[src][dest]);
     assert(linkBusyUntil_[src][dest] < 0);
 
-    // mark the chunk information and set link as busy until the specified time
+    // reserve physical route now (atomic multi-segment)
+    const auto& r = routes_[src][dest];
+    reserveRoute_(r, currentTime_);
+    // mark GPU-level virtual link
     available_[src][dest] = false;
     chunk_[src][dest] = chunk;
     linkBusyUntil_[src][dest] = time;
 
-    // account for switch occupancy if this is a hyper-edge
-    const int sid = viaSwitchId_[src][dest];
-    if (sid >= 0) {
-        // should only schedule when under cap
-        assert(switchActive_[sid] < switchMaxParallel_[sid]);
-        ++switchActive_[sid];
-    }
+    // // mark the chunk information and set link as busy until the specified time
+    // available_[src][dest] = false;
+    // chunk_[src][dest] = chunk;
+    // linkBusyUntil_[src][dest] = time;
+
+    // // account for switch occupancy if this is a hyper-edge
+    // const int sid = viaSwitchId_[src][dest];
+    // if (sid >= 0) {
+    //     // should only schedule when under cap
+    //     assert(switchActive_[sid] < switchMaxParallel_[sid]);
+    //     ++switchActive_[sid];
+    // }
 }
 
 void TimeExpandedNetwork::transferFinished(const NpuID src, const NpuID dest) noexcept {
@@ -136,12 +180,12 @@ void TimeExpandedNetwork::transferFinished(const NpuID src, const NpuID dest) no
     linkBusyUntil_[src][dest] = -1;
     chunk_[src][dest] = -1;
 
-    // release switch occupancy if needed
-    const int sid = viaSwitchId_[src][dest];
-    if (sid >= 0) {
-        assert(switchActive_[sid] > 0);
-        --switchActive_[sid];
-    }
+    // // release switch occupancy if needed
+    // const int sid = viaSwitchId_[src][dest];
+    // if (sid >= 0) {
+    //     assert(switchActive_[sid] > 0);
+    //     --switchActive_[sid];
+    // }
 }
 
 TimeExpandedNetwork::Time TimeExpandedNetwork::linkTransferTime(const NpuID src,
@@ -150,17 +194,18 @@ TimeExpandedNetwork::Time TimeExpandedNetwork::linkTransferTime(const NpuID src,
     assert(0 <= dest && dest < npusCount_);
     assert(topology_.connected(src, dest));
 
-    const auto linkTime = linkTransferTimes_[src][dest];
+    const auto& linkTime = routes_[src][dest].total;
+    // const auto linkTime = linkTransferTimes_[src][dest];
     assert(linkTime >= 0);
 
     return linkTime;
 }
 
-bool TimeExpandedNetwork::switchCapOk_(const NpuID src, const NpuID dest) const noexcept {
-    const int sid = viaSwitchId_[src][dest];
-    if (sid < 0) return true;
-    return switchActive_[sid] < switchMaxParallel_[sid];
-}
+// bool TimeExpandedNetwork::switchCapOk_(const NpuID src, const NpuID dest) const noexcept {
+//     const int sid = viaSwitchId_[src][dest];
+//     if (sid < 0) return true;
+//     return switchActive_[sid] < switchMaxParallel_[sid];
+// }
 
 void TimeExpandedNetwork::computeLinkTimes_(const ChunkSize chunkSize) noexcept {
     assert(chunkSize > 0);
@@ -172,9 +217,9 @@ void TimeExpandedNetwork::computeLinkTimes_(const ChunkSize chunkSize) noexcept 
                 continue;
             };
 
-            if (topology_.isViaSwitch(src, dest)) {
-                viaSwitchId_[src][dest] = topology_.viaSwitchId(src, dest);
-            }
+            // if (topology_.isViaSwitch(src, dest)) {
+            //     viaSwitchId_[src][dest] = topology_.viaSwitchId(src, dest);
+            // }
 
             // use alpha-beta model to calculate link transfer time
             const auto bandwidth = topology_.bandwidth(src, dest);
@@ -200,4 +245,133 @@ TimeExpandedNetwork::Time TimeExpandedNetwork::alphaBetaModel_(const Bandwidth b
     const auto beta = chunkSize / bandwidthConverted;
 
     return alpha + beta;
+}
+
+// ===== helpers =====
+void TimeExpandedNetwork::computeEdgeTimes_(const ChunkSize chunkSize) noexcept {
+    // init to no-edge
+    for (int u = 0; u < totalNodes_; ++u)
+      for (int v = 0; v < totalNodes_; ++v) {
+        edgeBusyUntil_[u][v] = -1;
+        edgeDelta_[u][v] = -1;
+        hasEdge_[u][v] = 0;
+      }
+    // fill from topology.physLinks
+    for (const auto& e : topology_.physLinks()) {
+        const double bwGiB = std::max(1e-12, (double)e.bw);
+        const double beta_us = (double)chunkSize / (bwGiB * 1024.0 * 1024.0 * 1024.0) * 1e6; // GiB/s -> μs
+        const double delta = e.alpha + beta_us;
+        edgeDelta_[e.src][e.dst] = (Time)std::llround(delta);
+        hasEdge_[e.src][e.dst] = 1;
+        edgeBusyUntil_[e.src][e.dst] = -1;
+    }
+}
+
+void TimeExpandedNetwork::computeRoutes_(const ChunkSize /*chunkSize*/) noexcept {
+    // Dijkstra per source GPU
+    const int N = totalNodes_;
+    routes_.assign(npusCount_, std::vector<Route>(npusCount_));
+    // adjacency
+    std::vector<std::vector<std::pair<int, Time>>> adj(N);
+    for (int u = 0; u < N; ++u) {
+        for (int v = 0; v < N; ++v) if (hasEdge_[u][v]) {
+            adj[u].push_back({v, edgeDelta_[u][v]});
+        }
+    }
+    auto reconstruct = [&](int s, int t, const std::vector<int>& prev) {
+        Route r;
+        if (prev[t] < 0) return r;
+        std::vector<int> path;
+        for (int x = t; x != -1; x = prev[x]) path.push_back(x);
+        std::reverse(path.begin(), path.end());
+        r.nodes = path;
+        r.total = 0;
+        for (size_t i = 1; i < path.size(); ++i) {
+            int u = path[i-1], v = path[i];
+            r.deltas.push_back(edgeDelta_[u][v]);
+            r.total += edgeDelta_[u][v];
+        }
+        return r;
+    };
+    for (int sGPU = 0; sGPU < npusCount_; ++sGPU) {
+        const int s = sGPU; // deviceNode == GPU id
+        std::vector<Time> dist(N, std::numeric_limits<Time>::max()/4);
+        std::vector<int>  prev(N, -1);
+        using QN = std::pair<Time,int>;
+        std::priority_queue<QN, std::vector<QN>, std::greater<QN>> pq;
+        dist[s] = 0; pq.push({0,s});
+        while(!pq.empty()) {
+            auto [du,u] = pq.top(); pq.pop();
+            if (du != dist[u]) continue;
+            for (auto [v,w] : adj[u]) {
+                if (dist[v] > du + w) { dist[v] = du + w; prev[v] = u; pq.push({dist[v], v}); }
+            }
+        }
+        for (int tGPU = 0; tGPU < npusCount_; ++tGPU) {
+            if (sGPU == tGPU) continue;
+            if (!topology_.connected(sGPU, tGPU)) continue;
+            const int t = tGPU;
+            routes_[sGPU][tGPU] = reconstruct(s, t, prev);
+            linkTransferTimes_[sGPU][tGPU] = routes_[sGPU][tGPU].total;
+        }
+    }
+}
+
+bool TimeExpandedNetwork::swCapOkAt_(const int sid, const Time s, const Time e, const bool isIn) const noexcept {
+    const auto& vec = isIn ? swInUse_[sid] : swOutUse_[sid];
+    const int cap = isIn ? swInCap_[sid] : swOutCap_[sid];
+    // count overlaps in [s,e)
+    int overlap = 0;
+    for (const auto& itv : vec) {
+        if (!(e <= itv.s || s >= itv.e)) { // overlap
+            ++overlap;
+            if (overlap >= cap) return false;
+        }
+    }
+    return true;
+}
+
+void TimeExpandedNetwork::swReserve_(const int sid, const Time s, const Time e, const bool isIn) noexcept {
+    auto& vec = isIn ? swInUse_[sid] : swOutUse_[sid];
+    vec.push_back({s,e});
+}
+
+bool TimeExpandedNetwork::canReserveRoute_(const Route& r, const Time t0) const noexcept {
+    if (r.nodes.size() < 2) return false;
+    Time t = t0;
+    for (size_t i = 1; i < r.nodes.size(); ++i) {
+        int u = r.nodes[i-1], v = r.nodes[i];
+        const Time d = r.deltas[i-1];
+        // link must be free at t
+        if (!hasEdge_[u][v]) return false;
+        if (edgeBusyUntil_[u][v] > t) return false;
+        // switch caps at u/v if they are switches
+        const int sid_u = topology_.switchIdFromNode(u);
+        const int sid_v = topology_.switchIdFromNode(v);
+        // entering v (if v is switch) consumes its IN; leaving u (if u is switch) consumes its OUT
+        if (sid_u >= 0) { // leaving switch u
+            if (!swCapOkAt_(sid_u, t, t + d, /*isIn=*/false)) return false;
+        }
+        if (sid_v >= 0) { // entering switch v
+            if (!swCapOkAt_(sid_v, t, t + d, /*isIn=*/true)) return false;
+        }
+        t += d;
+    }
+    return true;
+}
+
+void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept {
+    Time t = t0;
+    for (size_t i = 1; i < r.nodes.size(); ++i) {
+        int u = r.nodes[i-1], v = r.nodes[i];
+        const Time d = r.deltas[i-1];
+        // mark edge busy
+        edgeBusyUntil_[u][v] = t + d;
+        // switch caps
+        const int sid_u = topology_.switchIdFromNode(u);
+        const int sid_v = topology_.switchIdFromNode(v);
+        if (sid_u >= 0) swReserve_(sid_u, t, t + d, /*isIn=*/false);
+        if (sid_v >= 0) swReserve_(sid_v, t, t + d, /*isIn=*/true);
+        t += d;
+    }
 }

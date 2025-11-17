@@ -8,6 +8,8 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 
 #include <cassert>
 #include <tacos/topology/topology.h>
+#include <queue>
+#include <limits>
 
 using namespace tacos;
 
@@ -28,10 +30,15 @@ void Topology::setNpusCount_(const int npusCount) noexcept {
         backtrackMap_[dest] = {};
     }
 
-    // initialize switch-aware matrices
-    viaSwitchId_.assign(npusCount_, std::vector<int>(npusCount_, -1));
+    // reset physical graph (switches/links can be re-added)
+    switches_.clear();
     switchesCount_ = 0;
-    switchMaxParallel_.clear();
+    physLinks_.clear();
+
+    // // initialize switch-aware matrices
+    // viaSwitchId_.assign(npusCount_, std::vector<int>(npusCount_, -1));
+    // switchesCount_ = 0;
+    // switchMaxParallel_.clear();
 }
 
 Topology::Bandwidth Topology::bandwidth(NpuID src, NpuID dest) const noexcept {
@@ -92,64 +99,163 @@ int Topology::npusCount() const noexcept {
     return npusCount_;
 }
 
-// ===== Switch-aware (TE-CCL style) impl =====
-SwitchID Topology::addSwitchUniform(const std::vector<NpuID>& ports,
-                                    Bandwidth uplinkBandwidth,
-                                    Latency gpu2swLatency,
-                                    Latency sw2gpuLatency,
-                                    int maxParallelEdges) noexcept {
-    // Register switch
-    const SwitchID sid = switchesCount_++;
-    const int deg = static_cast<int>(ports.size());
-    const int cap = (maxParallelEdges > 0) ? maxParallelEdges : deg; // TE-CCL Appendix C: min(in,out)=deg
-    switchMaxParallel_.push_back(cap);
+// ===== multi-switch additions =====
+SwitchID Topology::addSwitch(const std::string& name, bool allowCopy,
+                                       int inCap, int outCap) noexcept {
+    Switch sw;
+    sw.name = name;
+    sw.allowCopy = allowCopy;
+    sw.inCap = inCap;
+    sw.outCap = outCap;
+    switches_.push_back(sw);
+    return switchesCount_++;
+}
 
-    // Create gpu->gpu synthetic links via this switch
-    const Latency viaLatency = gpu2swLatency + sw2gpuLatency; // α_sw = α_g2s + α_s2g
-    for (int i = 0; i < deg; ++i) {
-        for (int j = 0; j < deg; ++j) {
-            if (i == j) continue;
-            const NpuID u = ports[i];
-            const NpuID v = ports[j];
-            // If there is already a direct edge u->v, keep it (prefer direct); otherwise add hyper-edge
-            if (!connected_[u][v]) {
-                connect_(u, v, uplinkBandwidth, viaLatency, false /*bi set below*/);
-                connected_[u][v] = true;
-                bandwidths_[u][v] = uplinkBandwidth;
-                latencies_[u][v] = viaLatency;
-                backtrackMap_[v].push_back(u);
-                viaSwitchId_[u][v] = sid;
+void Topology::addPhysLink(const NodeIndex u, const NodeIndex v,
+                           const Bandwidth bw, const Latency alpha) noexcept {
+    physLinks_.push_back(PhysLink{u, v, bw, alpha});
+}
+
+int Topology::switchInCapResolved(const SwitchID sid) const noexcept {
+    const auto& sw = switches_[sid];
+    if (sw.inCap > 0) return sw.inCap;
+    // default: degree from incoming physLinks
+    int deg = 0;
+    for (const auto& e : physLinks_) if (e.dst == switchNode(sid)) ++deg;
+    return std::max(1, deg);
+}
+
+int Topology::switchOutCapResolved(const SwitchID sid) const noexcept {
+    const auto& sw = switches_[sid];
+    if (sw.outCap > 0) return sw.outCap;
+    int deg = 0;
+    for (const auto& e : physLinks_) if (e.src == switchNode(sid)) ++deg;
+    return std::max(1, deg);
+}
+
+// Get link statistics by type
+std::tuple<int, int, int, int> Topology::getLinkStatistics() const noexcept {
+    int deviceToDevice = 0;
+    int deviceToSwitch = 0;
+    int switchToDevice = 0;
+    int switchToSwitch = 0;
+
+    for (const auto& link : physLinks_) {
+        const bool srcIsDevice = (link.src < npusCount_);
+        const bool dstIsDevice = (link.dst < npusCount_);
+
+        if (srcIsDevice && dstIsDevice) {
+            ++deviceToDevice;
+        } else if (srcIsDevice && !dstIsDevice) {
+            ++deviceToSwitch;
+        } else if (!srcIsDevice && dstIsDevice) {
+            ++switchToDevice;
+        } else {
+            ++switchToSwitch;
+        }
+    }
+
+    return std::make_tuple(deviceToDevice, deviceToSwitch, switchToDevice, switchToSwitch);
+}
+
+// Compute GPU->GPU reachability from the physical graph
+void Topology::finalizeReachability_() noexcept {
+    // init
+    for (int u = 0; u < npusCount_; ++u) {
+        for (int v = 0; v < npusCount_; ++v) {
+            connected_[u][v] = (u == v ? false : connected_[u][v]);
+            bandwidths_[u][v] = bandwidths_[u][v];
+            latencies_[u][v] = latencies_[u][v];
+        }
+        backtrackMap_[u].clear();
+    }
+    // BFS/Dijkstra over physical graph to check reachability
+    const int T = totalNodes();
+    std::vector<std::vector<int>> adj(T);
+    for (int i = 0; i < (int)physLinks_.size(); ++i) {
+        adj[physLinks_[i].src].push_back(i); // store edge index
+    }
+    for (int s = 0; s < npusCount_; ++s) {
+        std::vector<char> seen(T, 0);
+        std::queue<int> q;
+        seen[s] = 1; q.push(s);
+        while(!q.empty()) {
+            int x = q.front(); q.pop();
+            for (int ei : adj[x]) {
+                const auto& e = physLinks_[ei];
+                if (!seen[e.dst]) { seen[e.dst] = 1; q.push(e.dst); }
+            }
+        }
+        for (int t = 0; t < npusCount_; ++t) {
+            if (s == t) continue;
+            if (seen[t]) {
+                connected_[s][t] = true;
+                backtrackMap_[t].push_back(s);
+                // bandwidth/latency at GPU-level is only for "estimation"; actual scheduling is calculated by TEN along the path
+                // Keep 0 here; TEN's shortest path calculation will fill in the actual end-to-end time
             }
         }
     }
-    // make it bidirectional in a single pass (via connect_ above already adds both if true)
-    for (int i = 0; i < deg; ++i) {
-        for (int j = 0; j < deg; ++j) {
-            if (i == j) continue;
-            const NpuID u = ports[i];
-            const NpuID v = ports[j];
-            // mirror id for reverse if created above
-            if (viaSwitchId_[u][v] == sid) {
-                viaSwitchId_[v][u] = sid;
-            }
-        }
-    }
-    return sid;
 }
 
-int Topology::switchParallelLimit(const SwitchID sid) const noexcept {
-    assert(sid >= 0 && sid < switchesCount_);
-    return switchMaxParallel_[sid];
-}
+// // ===== Switch-aware (TE-CCL style) impl =====
+// SwitchID Topology::addSwitchUniform(const std::vector<NpuID>& ports,
+//                                     Bandwidth uplinkBandwidth,
+//                                     Latency gpu2swLatency,
+//                                     Latency sw2gpuLatency,
+//                                     int maxParallelEdges) noexcept {
+//     // Register switch
+//     const SwitchID sid = switchesCount_++;
+//     const int deg = static_cast<int>(ports.size());
+//     const int cap = (maxParallelEdges > 0) ? maxParallelEdges : deg; // TE-CCL Appendix C: min(in,out)=deg
+//     switchMaxParallel_.push_back(cap);
 
-bool Topology::isViaSwitch(const NpuID src, const NpuID dest) const noexcept {
-    assert(0 <= src && src < npusCount_);
-    assert(0 <= dest && dest < npusCount_);
-    return viaSwitchId_[src][dest] >= 0;
-}
+//     // Create gpu->gpu synthetic links via this switch
+//     const Latency viaLatency = gpu2swLatency + sw2gpuLatency; // α_sw = α_g2s + α_s2g
+//     for (int i = 0; i < deg; ++i) {
+//         for (int j = 0; j < deg; ++j) {
+//             if (i == j) continue;
+//             const NpuID u = ports[i];
+//             const NpuID v = ports[j];
+//             // If there is already a direct edge u->v, keep it (prefer direct); otherwise add hyper-edge
+//             if (!connected_[u][v]) {
+//                 connect_(u, v, uplinkBandwidth, viaLatency, false /*bi set below*/);
+//                 connected_[u][v] = true;
+//                 bandwidths_[u][v] = uplinkBandwidth;
+//                 latencies_[u][v] = viaLatency;
+//                 backtrackMap_[v].push_back(u);
+//                 viaSwitchId_[u][v] = sid;
+//             }
+//         }
+//     }
+//     // make it bidirectional in a single pass (via connect_ above already adds both if true)
+//     for (int i = 0; i < deg; ++i) {
+//         for (int j = 0; j < deg; ++j) {
+//             if (i == j) continue;
+//             const NpuID u = ports[i];
+//             const NpuID v = ports[j];
+//             // mirror id for reverse if created above
+//             if (viaSwitchId_[u][v] == sid) {
+//                 viaSwitchId_[v][u] = sid;
+//             }
+//         }
+//     }
+//     return sid;
+// }
 
-int Topology::viaSwitchId(const NpuID src, const NpuID dest) const noexcept {
-    assert(0 <= src && src < npusCount_);
-    assert(0 <= dest && dest < npusCount_);
-    return viaSwitchId_[src][dest];
-}
+// int Topology::switchParallelLimit(const SwitchID sid) const noexcept {
+//     assert(sid >= 0 && sid < switchesCount_);
+//     return switchMaxParallel_[sid];
+// }
+
+// bool Topology::isViaSwitch(const NpuID src, const NpuID dest) const noexcept {
+//     assert(0 <= src && src < npusCount_);
+//     assert(0 <= dest && dest < npusCount_);
+//     return viaSwitchId_[src][dest] >= 0;
+// }
+
+// int Topology::viaSwitchId(const NpuID src, const NpuID dest) const noexcept {
+//     assert(0 <= src && src < npusCount_);
+//     assert(0 <= dest && dest < npusCount_);
+//     return viaSwitchId_[src][dest];
+// }

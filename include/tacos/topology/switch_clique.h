@@ -20,16 +20,29 @@ class SwitchClique final : public Topology {
   /// @param uplinkBandwidth per-port GPU<->Switch bandwidth (GiB/sec)
   /// @param gpu2swLatency   GPU->Switch latency (us)
   /// @param sw2gpuLatency   Switch->GPU latency (us)
-  /// @param maxParallel     optional cap on #simultaneous hyper-edges through the switch
+  /// @param allowCopy       whether switch allows packet copy
+  /// @param maxParallel     optional cap on #simultaneous transfers through the switch (-1 = unlimited)
   SwitchClique(int npusCount,
                Bandwidth uplinkBandwidth,
                Latency gpu2swLatency,
                Latency sw2gpuLatency,
+               bool allowCopy = false,
                int maxParallel = -1) noexcept {
     setNpusCount_(npusCount);
-    std::vector<NpuID> ports(npusCount);
-    for (int i = 0; i < npusCount; ++i) ports[i] = i;
-    addSwitchUniform(ports, uplinkBandwidth, gpu2swLatency, sw2gpuLatency, maxParallel);
+    
+    // Add a single central switch connecting all GPUs
+    auto sw = addSwitch("SW", allowCopy, 
+                       maxParallel > 0 ? maxParallel : npusCount,  // inCap
+                       maxParallel > 0 ? maxParallel : npusCount); // outCap
+    
+    // Connect each GPU to the switch bidirectionally
+    for (int g = 0; g < npusCount; ++g) {
+      addPhysLink(deviceNode(g), switchNode(sw), uplinkBandwidth, gpu2swLatency);
+      addPhysLink(switchNode(sw), deviceNode(g), uplinkBandwidth, sw2gpuLatency);
+    }
+    
+    // Finalize reachability to compute GPU->GPU paths
+    finalizeReachability_();
   }
 };
 
