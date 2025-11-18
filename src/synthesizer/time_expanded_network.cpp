@@ -27,18 +27,6 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     linkTransferTimes_ =
         decltype(linkTransferTimes_)(npusCount_, std::vector<Time>(npusCount_, -1));
 
-    // viaSwitchId_.assign(npusCount_, std::vector<int>(npusCount_, -1));
-    // // initialize switch caps
-    // const int swCount = topology_.switchesCount();
-    // switchActive_.assign(swCount, 0);
-    // switchMaxParallel_.assign(swCount, 0);
-    // for (int sid = 0; sid < swCount; ++sid) {
-    //     switchMaxParallel_[sid] = topology_.switchParallelLimit(sid);
-    // }
-
-    // // calculate link transfer times
-    // computeLinkTimes_(chunkSize);
-
     // physical graph resources
     edgeBusyUntil_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
     edgeDelta_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
@@ -107,19 +95,6 @@ std::unordered_set<TimeExpandedNetwork::NpuID> TimeExpandedNetwork::backtrack(
             sources.insert(src);
         }
     }
-
-    // // filter the available sources from the topology backtracking
-    // for (const auto src : topology_.backtrack(dest)) {
-    //     if (available_[src][dest]) {
-
-    //         // If link goes via a switch, enforce switch concurrent-cap
-    //         if (viaSwitchId_[src][dest] >= 0) {
-    //             if (!switchCapOk_(src, dest)) continue;
-    //         }
-
-    //         sources.insert(src);
-    //     }
-    // }
 
     return sources;
 }
@@ -228,18 +203,6 @@ void TimeExpandedNetwork::transferChunk(const NpuID src,
     chunk_[src][dest] = chunk;
     linkBusyUntil_[src][dest] = time;
 
-    // // mark the chunk information and set link as busy until the specified time
-    // available_[src][dest] = false;
-    // chunk_[src][dest] = chunk;
-    // linkBusyUntil_[src][dest] = time;
-
-    // // account for switch occupancy if this is a hyper-edge
-    // const int sid = viaSwitchId_[src][dest];
-    // if (sid >= 0) {
-    //     // should only schedule when under cap
-    //     assert(switchActive_[sid] < switchMaxParallel_[sid]);
-    //     ++switchActive_[sid];
-    // }
 }
 
 void TimeExpandedNetwork::transferFinished(const NpuID src, const NpuID dest) noexcept {
@@ -251,12 +214,6 @@ void TimeExpandedNetwork::transferFinished(const NpuID src, const NpuID dest) no
     linkBusyUntil_[src][dest] = -1;
     chunk_[src][dest] = -1;
 
-    // // release switch occupancy if needed
-    // const int sid = viaSwitchId_[src][dest];
-    // if (sid >= 0) {
-    //     assert(switchActive_[sid] > 0);
-    //     --switchActive_[sid];
-    // }
 }
 
 std::vector<int> TimeExpandedNetwork::getRoutePath(const NpuID src, const NpuID dest) const noexcept {
@@ -314,12 +271,6 @@ TimeExpandedNetwork::Time TimeExpandedNetwork::linkTransferTime(const NpuID src,
     return linkTime;
 }
 
-// bool TimeExpandedNetwork::switchCapOk_(const NpuID src, const NpuID dest) const noexcept {
-//     const int sid = viaSwitchId_[src][dest];
-//     if (sid < 0) return true;
-//     return switchActive_[sid] < switchMaxParallel_[sid];
-// }
-
 void TimeExpandedNetwork::computeLinkTimes_(const ChunkSize chunkSize) noexcept {
     assert(chunkSize > 0);
 
@@ -329,10 +280,6 @@ void TimeExpandedNetwork::computeLinkTimes_(const ChunkSize chunkSize) noexcept 
             if (!topology_.connected(src, dest)) {
                 continue;
             };
-
-            // if (topology_.isViaSwitch(src, dest)) {
-            //     viaSwitchId_[src][dest] = topology_.viaSwitchId(src, dest);
-            // }
 
             // use alpha-beta model to calculate link transfer time
             const auto bandwidth = topology_.bandwidth(src, dest);
