@@ -22,18 +22,21 @@ class SwitchClique final : public Topology {
   /// @param sw2gpuLatency   Switch->GPU latency (us)
   /// @param allowCopy       whether switch allows packet copy
   /// @param maxParallel     optional cap on #simultaneous transfers through the switch (-1 = unlimited)
+  /// @param forwardingMode  switch forwarding mode (CUT_THROUGH for NVSwitch, STORE_AND_FORWARD for IB/RoCE)
   SwitchClique(int npusCount,
                Bandwidth uplinkBandwidth,
                Latency gpu2swLatency,
                Latency sw2gpuLatency,
                bool allowCopy = false,
-               int maxParallel = -1) noexcept {
+               int maxParallel = -1,
+               SwitchForwardingMode forwardingMode = SwitchForwardingMode::STORE_AND_FORWARD) noexcept {
     setNpusCount_(npusCount);
     
     // Add a single central switch connecting all GPUs
     auto sw = addSwitch("SW", allowCopy, 
                        maxParallel > 0 ? maxParallel : npusCount,  // inCap
-                       maxParallel > 0 ? maxParallel : npusCount); // outCap
+                       maxParallel > 0 ? maxParallel : npusCount,  // outCap
+                       forwardingMode);
     
     // Connect each GPU to the switch bidirectionally
     for (int g = 0; g < npusCount; ++g) {
@@ -41,8 +44,7 @@ class SwitchClique final : public Topology {
       addPhysLink(switchNode(sw), deviceNode(g), uplinkBandwidth, sw2gpuLatency);
     }
     
-    // Finalize reachability to compute GPU->GPU paths
-    finalizeReachability_();
+    // Note: finalizeReachability_() should be called by the user after topology construction
   }
 };
 

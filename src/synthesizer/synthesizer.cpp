@@ -13,6 +13,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <algorithm>
 #include <map>
 #include <tacos/synthesizer/synthesizer.h>
+#include <tacos/event_queue/timer.h>
 #include "log.h"
 
 using namespace tacos;
@@ -24,6 +25,23 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
                                      ChunkSize chunkSize) noexcept {
     assert(chunkSize > 0);
 
+    // Performance tracking variables (only active if ENABLE_PERF_STATS is defined)
+#ifdef ENABLE_PERF_STATS
+    auto solveTimer = Timer();
+    solveTimer.start();
+    auto initTimer = Timer();
+    
+    int iterationCount = 0;
+    double totalFilterTime = 0.0;
+    double totalExpandTime = 0.0;
+    double totalPruneTime = 0.0;
+    double totalMatchingTime = 0.0;
+    auto perfTimer = Timer();
+    
+    // Track initialization phase
+    initTimer.start();
+#endif
+
     // initialize the synthesizer
     initialize_(topology, collective, chunkSize);
 
@@ -31,35 +49,47 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
     // that is, chunks in preconditions are already at their sources
     markPrecondition_();
 
+    // Initialize and sort all postconditions ONCE
+    initializeSortedPostconditions_();
+
+#ifdef ENABLE_PERF_STATS
+    initTimer.stop();
+    auto totalInitTime = initTimer.time();
+#endif
+    
     // then, repeat the link-chunk matching process
     while (!eventQueue_.empty()) {
+        PerfLog(++iterationCount);
+        
         // get current event time
         currentTime_ = eventQueue_.pop();
         DebugLog(std::cout << "[TacosEvent]" << std::endl);
         DebugLog(std::cout << "At Time: " << currentTime_ << std::endl);
 
-        // first, filter out unsatisfied postconditions
-        // this is required when choosing the chunk replacement candidates
-        // during the expansion of the TEN
-        auto postconditionMap = filterPostcondition_();
+        // === PHASE 1: Convert sorted postconditions to map (for replacement logic) ===
+        PerfLog(perfTimer.start());
+        auto postconditionMap = PostconditionMap();
+        for (const auto& [chunk, dest] : sortedPostconditions_) {
+            postconditionMap[dest].insert(chunk);
+        }
+        PerfLog(perfTimer.stop(); totalFilterTime += perfTimer.time());
 
-        // then, expand the TEN
-        // this method will also process and update the arrival of chunks
-        // at the current timestep, and will change the unsatisfied postconditions
-        // and return the number of replacements performed
+        // === PHASE 2: Expand TEN ===
+        PerfLog(perfTimer.start());
         const auto [replacedCount, discardedCount] = expandTenTimestep_(&postconditionMap);
+        PerfLog(perfTimer.stop(); totalExpandTime += perfTimer.time());
         DebugLog(std::cout << "Replaced: " << replacedCount << std::endl);
         DebugLog(std::cout << "Discarded: " << discardedCount << std::endl);
 
-        // count total number of unsatisfied chunk requests across all destinations
-        auto unsatisfiedCount = 0;
-        for (const auto &kv : postconditionMap) unsatisfiedCount += static_cast<int>(kv.second.size());
-        DebugLog(std::cout << "unsatisfied postconditions: " << unsatisfiedCount << std::endl);
+        // === PHASE 3: Prune Satisfied Postconditions ===
+        // Remove conditions that have been satisfied (much faster than re-sorting)
+        PerfLog(perfTimer.start());
+        pruneSatisfiedPostconditions_();
+        PerfLog(perfTimer.stop(); totalPruneTime += perfTimer.time());
 
-        // after the expansion of the TEN, check if there are any unsatisfied postconditions
-        auto postcondition = shufflePostcondition_(postconditionMap);
+        DebugLog(std::cout << "unsatisfied postconditions: " << sortedPostconditions_.size() << std::endl);
 
-        if (postcondition.empty()) {
+        if (sortedPostconditions_.empty()) {
             // no unsatisfied postcondition left to map
             // if so, just proceed to the next event
             // until all chunks arrive at their destinations
@@ -73,16 +103,21 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
         // This ensures no physical edge is used by multiple routes in the same round
         ten_->clearRoundUsedEdges();
 
+        // Optimization: Cache backtrack results for this timestep
+        // Multiple conditions may have the same destination, so we cache to avoid repeated computation
+        std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
+
         // Matching policy (per-route, no global hop limit):
         // - If shortest path has no switch, require 1-hop only
         // - If path includes switches, prioritize fewer hops (no global cap)
         // - Reject routes mixing direct device edges with switch edges
         // All policy logic is implemented inside linkChunkMatching_
 
-        // for all unsatisfied postconditions, run link-chunk matching
-        for (const auto [chunk, dest] : postcondition) {
+        // === PHASE 4: Link-Chunk Matching ===
+        PerfLog(perfTimer.start());
+        for (const auto [chunk, dest] : sortedPostconditions_) {
             // linkChunkMatching_ returns the selected source NPU, or -1 if failed
-            const auto selectedSrc = linkChunkMatching_(chunk, dest);
+            const auto selectedSrc = linkChunkMatching_(chunk, dest, backtrackCache);
             
             if (selectedSrc >= 0) {
                 // Get the actual route path that was reserved
@@ -91,17 +126,28 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
                 ++successfulMatchingCount;
             }
         }
-
+        PerfLog(perfTimer.stop(); totalMatchingTime += perfTimer.time());
         DebugLog(std::cout << "Scheduled: " << successfulMatchingCount << std::endl);
         
-        // Print matched routes with hop count
+        // Print matched routes with physical hop count prioritized
         DebugLog(
-            int totalHops = 0;
+            int totalLogicalHops = 0;
+            int totalPhysicalHops = 0;
             for (const auto& [chunk, src, dest, path] : matchedRoutes) {
-                int hops = path.empty() ? 0 : static_cast<int>(path.size()) - 1;
-                totalHops += hops;
+                // Physical hops = path length - 1
+                int physicalHops = path.empty() ? 0 : static_cast<int>(path.size()) - 1;
+                // Logical hops from TEN (considers Cut-Through switches)
+                int logicalHops = ten_->routeHopCount(src, dest);
+                if (logicalHops < 0) logicalHops = physicalHops; // fallback
+                
+                totalLogicalHops += logicalHops;
+                totalPhysicalHops += physicalHops;
+                
                 std::cout << "  Chunk " << chunk << ": GPU" << src << " -> GPU" << dest 
-                          << " [" << hops << " hop" << (hops != 1 ? "s" : "") << "]";
+                          << " [" << physicalHops << " physical hop" << (physicalHops != 1 ? "s" : "") << "]";
+                if (logicalHops != physicalHops) {
+                    std::cout << " (" << logicalHops << " logical)";
+                }
                 if (!path.empty()) {
                     std::cout << " (";
                     for (size_t i = 0; i < path.size(); ++i) {
@@ -113,12 +159,50 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
                 std::cout << std::endl;
             }
             if (!matchedRoutes.empty()) {
-                double avgHops = static_cast<double>(totalHops) / matchedRoutes.size();
-                std::cout << "  Average hops: " << std::fixed << std::setprecision(2) << avgHops << std::endl;
+                double avgLogical = static_cast<double>(totalLogicalHops) / matchedRoutes.size();
+                double avgPhysical = static_cast<double>(totalPhysicalHops) / matchedRoutes.size();
+                std::cout << "  Average physical hops: " << std::fixed << std::setprecision(2) << avgPhysical;
+                if (avgLogical != avgPhysical) {
+                    std::cout << " (logical: " << avgLogical << ")";
+                }
+                std::cout << std::endl;
             }
         );
         DebugLog(std::cout << std::endl);
     }
+
+    // === Print Performance Summary ===
+    PerfLog(
+        solveTimer.stop();
+        auto totalSolveTime = solveTimer.time();
+        
+        double totalLoopTime = totalFilterTime + totalExpandTime + totalPruneTime + totalMatchingTime;
+        std::cout << std::endl;
+        std::cout << "=================================================" << std::endl;
+        std::cout << "======== Synthesizer Performance Summary ========" << std::endl;
+        std::cout << "Total solve() time: " << totalSolveTime / 1000.0 << " ms" << std::endl;
+        std::cout << "Total iterations: " << iterationCount << std::endl;
+        std::cout << std::endl;
+        
+        std::cout << "Time breakdown:" << std::endl;
+        std::cout << "  Initialization:          " << std::fixed << std::setprecision(2) << std::setw(8)
+                  << totalInitTime / 1000.0 << " ms  (" << std::setw(5)
+                  << (totalInitTime / totalSolveTime * 100) << "%)" << std::endl;
+        std::cout << "  convertToMap:            " << std::setw(8)
+                  << totalFilterTime / 1000.0 << " ms  (" << std::setw(5)
+                  << (totalFilterTime / totalSolveTime * 100) << "%)" << std::endl;
+        std::cout << "  expandTenTimestep:       " << std::setw(8)
+                  << totalExpandTime / 1000.0 << " ms  (" << std::setw(5)
+                  << (totalExpandTime / totalSolveTime * 100) << "%)" << std::endl;
+        std::cout << "  pruneSatisfiedPostcond:  " << std::setw(8)
+                  << totalPruneTime / 1000.0 << " ms  (" << std::setw(5)
+                  << (totalPruneTime / totalSolveTime * 100) << "%)" << std::endl;
+        std::cout << "  linkChunkMatching:       " << std::setw(8)
+                  << totalMatchingTime / 1000.0 << " ms  (" << std::setw(5)
+                  << (totalMatchingTime / totalSolveTime * 100) << "%)" << std::endl;
+        std::cout << "=================================================" << std::endl;
+        std::cout << std::endl;
+    );
 
     // all matching has been finished
     // return measured collective_ time
@@ -156,6 +240,83 @@ void Synthesizer::markPrecondition_() noexcept {
     }
 }
 
+void Synthesizer::initializeSortedPostconditions_() noexcept {
+    // Build initial postcondition map
+    auto postconditionMap = PostconditionMap();
+    for (auto chunk = 0; chunk < chunksCount_; ++chunk) {
+        const auto dests = collective_->postcondition(chunk);
+        for (const auto dest : dests) {
+            if (!chunkMap_[chunk][dest]) {
+                postconditionMap[dest].insert(chunk);
+            }
+        }
+    }
+    
+    // Sort by physical hop count (same logic as shufflePostcondition_)
+    std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
+    
+    auto computeMinPhysicalHops = [this, &backtrackCache](ChunkID chunk, NpuID dest) -> int {
+        int minHops = std::numeric_limits<int>::max();
+        auto it = backtrackCache.find(dest);
+        if (it == backtrackCache.end()) {
+            it = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
+        }
+        const auto& sources = it->second;
+        for (const auto src : sources) {
+            if (chunkMap_[chunk][src]) {
+                int hops = ten_->getRoutePhysicalHops(src, dest);
+                minHops = std::min(minHops, hops);
+            }
+        }
+        return minHops;
+    };
+    
+    // Flatten and compute hop counts
+    std::vector<std::pair<Condition, int>> conditionsWithHops;
+    conditionsWithHops.reserve(postconditionMap.size() * 8);
+    for (const auto& [dest, chunks] : postconditionMap) {
+        for (const auto chunk : chunks) {
+            int minPhysicalHops = computeMinPhysicalHops(chunk, dest);
+            conditionsWithHops.emplace_back(Condition{chunk, dest}, minPhysicalHops);
+        }
+    }
+    
+    // Sort by physical hop count
+    std::stable_sort(conditionsWithHops.begin(), conditionsWithHops.end(),
+        [](const auto& a, const auto& b) {
+            return a.second < b.second;
+        });
+    
+    // Shuffle within same-hop groups
+    for (auto it = conditionsWithHops.begin(); it != conditionsWithHops.end(); ) {
+        int currentHops = it->second;
+        auto groupEnd = std::find_if(it, conditionsWithHops.end(),
+            [currentHops](const auto& elem) { 
+                return elem.second != currentHops; 
+            });
+        std::shuffle(it, groupEnd, randomEngine);
+        it = groupEnd;
+    }
+    
+    // Extract sorted conditions
+    sortedPostconditions_.clear();
+    sortedPostconditions_.reserve(conditionsWithHops.size());
+    for (const auto& [cond, _] : conditionsWithHops) {
+        sortedPostconditions_.push_back(cond);
+    }
+}
+
+void Synthesizer::pruneSatisfiedPostconditions_() noexcept {
+    // Remove conditions that have been satisfied (in-place removal)
+    sortedPostconditions_.erase(
+        std::remove_if(sortedPostconditions_.begin(), sortedPostconditions_.end(),
+            [this](const Condition& cond) {
+                return chunkMap_[cond.first][cond.second];
+            }),
+        sortedPostconditions_.end()
+    );
+}
+
 Synthesizer::PostconditionMap Synthesizer::filterPostcondition_() const noexcept {
     auto postconditionMap = PostconditionMap();
 
@@ -175,82 +336,87 @@ Synthesizer::PostconditionMap Synthesizer::filterPostcondition_() const noexcept
 
 std::vector<Synthesizer::Condition> Synthesizer::shufflePostcondition_(
     const PostconditionMap& postconditionMap) noexcept {
-    auto postcondition = std::vector<Condition>();
-
-    // flatten the postcondition map into a vector of conditions
-    for (const auto& [dest, chunks] : postconditionMap) {
-        for (const auto chunk : chunks) {
-            postcondition.emplace_back(chunk, dest);
-        }
-    }
-
-    // Sort by minimum hop count (shortest path) to prioritize direct/short paths
-    // This improves link utilization by avoiding long multi-hop paths when possible
-    std::stable_sort(postcondition.begin(), postcondition.end(),
-        [this](const Condition& a, const Condition& b) {
-            const auto [chunkA, destA] = a;
-            const auto [chunkB, destB] = b;
-            
-            // Find minimum hop count for condition A
-            int minHopsA = std::numeric_limits<int>::max();
-            auto sourcesA = ten_->backtrack(destA);
-            for (const auto src : sourcesA) {
-                if (chunkMap_[chunkA][src]) {
-                    int hops = ten_->getRouteHops(src, destA);
-                    minHopsA = std::min(minHopsA, hops);
-                }
-            }
-            
-            // Find minimum hop count for condition B
-            int minHopsB = std::numeric_limits<int>::max();
-            auto sourcesB = ten_->backtrack(destB);
-            for (const auto src : sourcesB) {
-                if (chunkMap_[chunkB][src]) {
-                    int hops = ten_->getRouteHops(src, destB);
-                    minHopsB = std::min(minHopsB, hops);
-                }
-            }
-            
-            return minHopsA < minHopsB;
-        });
     
-    // Shuffle conditions with the same hop count to add randomness
-    // This prevents bias towards specific chunks/destinations with same hop count
-    auto start = postcondition.begin();
-    for (auto it = postcondition.begin(); it != postcondition.end(); ) {
-        const auto [chunk, dest] = *it;
+    // Optimization: Cache backtrack results per destination (significant speedup for large postconditions)
+    std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
+    
+    // Helper function to compute minimum physical hop count for a condition
+    // Use physical hops for sorting to avoid Cut-Through routes getting unfair priority
+    auto computeMinPhysicalHops = [this, &backtrackCache](ChunkID chunk, NpuID dest) -> int {
+        int minHops = std::numeric_limits<int>::max();
         
-        // Find minimum hop count for current condition
-        int currentHops = std::numeric_limits<int>::max();
-        auto sources = ten_->backtrack(dest);
+        // Get or compute backtrack sources for this destination
+        auto it = backtrackCache.find(dest);
+        if (it == backtrackCache.end()) {
+            it = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
+        }
+        const auto& sources = it->second;
+        
         for (const auto src : sources) {
             if (chunkMap_[chunk][src]) {
-                int hops = ten_->getRouteHops(src, dest);
-                currentHops = std::min(currentHops, hops);
-                break; // Just need to know the minimum
+                int hops = ten_->getRoutePhysicalHops(src, dest);
+                minHops = std::min(minHops, hops);
             }
         }
+        return minHops;
+    };
+    
+    // Step 1: Flatten and precompute physical hop counts (compute once, use multiple times)
+    std::vector<std::pair<Condition, int>> conditionsWithHops;
+    conditionsWithHops.reserve(postconditionMap.size() * 8); // Rough estimate
+    
+    for (const auto& [dest, chunks] : postconditionMap) {
+        for (const auto chunk : chunks) {
+            int minPhysicalHops = computeMinPhysicalHops(chunk, dest);
+            conditionsWithHops.emplace_back(Condition{chunk, dest}, minPhysicalHops);
+        }
+    }
+    
+    // Step 2: Sort by physical hop count (using precomputed values)
+    std::stable_sort(conditionsWithHops.begin(), conditionsWithHops.end(),
+        [](const auto& a, const auto& b) {
+            return a.second < b.second;
+        });
+    
+    // Step 3: Shuffle within same-hop groups (using precomputed values)
+    for (auto it = conditionsWithHops.begin(); it != conditionsWithHops.end(); ) {
+        int currentHops = it->second;
         
         // Find end of same-hop-count group
-        auto groupEnd = it;
-        while (groupEnd != postcondition.end()) {
-            const auto [chunkG, destG] = *groupEnd;
-            int groupHops = std::numeric_limits<int>::max();
-            auto sourcesG = ten_->backtrack(destG);
-            for (const auto src : sourcesG) {
-                if (chunkMap_[chunkG][src]) {
-                    int hops = ten_->getRouteHops(src, destG);
-                    groupHops = std::min(groupHops, hops);
-                    break;
-                }
-            }
-            if (groupHops != currentHops) break;
-            ++groupEnd;
-        }
+        auto groupEnd = std::find_if(it, conditionsWithHops.end(),
+            [currentHops](const auto& elem) { 
+                return elem.second != currentHops; 
+            });
         
         // Shuffle within this group
         std::shuffle(it, groupEnd, randomEngine);
         it = groupEnd;
+    }
+    
+    // Step 4: Extract final postcondition list
+    std::vector<Condition> postcondition;
+    postcondition.reserve(conditionsWithHops.size());
+    
+    // Debug: Print physical hop count distribution (using cached hop counts)
+    std::map<int,int> hopCountDist;
+    DebugLog(
+        for (const auto& [cond, hops] : conditionsWithHops) {
+            if (hops != std::numeric_limits<int>::max()) {
+                hopCountDist[hops]++;
+            }
+        }
+        if (!hopCountDist.empty()) {
+            std::cout << "Postcondition physical hop distribution (ideal): ";
+            for (const auto& [hops, count] : hopCountDist) {
+                std::cout << hops << "-hop:" << count << " ";
+            }
+            std::cout << std::endl;
+            std::cout << "  Note: Actual scheduled hops may be longer due to resource conflicts." << std::endl;
+        }
+    );
+    
+    for (const auto& [cond, _] : conditionsWithHops) {
+        postcondition.push_back(cond);
     }
     
     return postcondition;
@@ -376,12 +542,18 @@ std::optional<Synthesizer::ChunkID> Synthesizer::findReplacementChunk_(
     return candidates[idx];
 }
 
-int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexcept {
-    // backtrack source NPUs
-    auto sources = ten_->backtrack(dest);
+int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
+                                   std::unordered_map<NpuID, std::unordered_set<NpuID>>& backtrackCache) noexcept {
+    // Get or compute backtrack source NPUs (use cache for performance)
+    auto it = backtrackCache.find(dest);
+    if (it == backtrackCache.end()) {
+        it = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
+    }
+    const auto& sources = it->second;
 
     // filter candidate link-chunk matching
-    // prioritize by: 1) minimum hop count, 2) earliest arrival time
+    // prioritize by: 1) minimum physical hop count, 2) earliest arrival time
+    // Use physical hops to avoid Cut-Through routes getting unfair priority
     auto minHopCount = std::numeric_limits<int>::max();
     auto arrivalTime = std::numeric_limits<Time>::max();
     auto candidates = std::vector<NpuID>();
@@ -393,8 +565,8 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexc
             continue;
         }
 
-        // get hop count and transfer time for this route
-        const auto hopCount = ten_->routeHopCount(src, dest);
+        // get physical hop count and transfer time for this route
+        const auto hopCount = ten_->getRoutePhysicalHops(src, dest);
         const auto linkWeight = ten_->linkTransferTime(src, dest);
         const auto linkTime = currentTime_ + linkWeight;
 

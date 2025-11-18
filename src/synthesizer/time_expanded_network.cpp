@@ -87,8 +87,8 @@ int TimeExpandedNetwork::routeHopCount(const NpuID src, const NpuID dest) const 
         return -1; // no valid route
     }
     
-    // Number of hops = number of edges = nodes.size() - 1
-    return static_cast<int>(route.nodes.size()) - 1;
+    // Return logical hop count (Cut-Through switches reduce hop count)
+    return route.logicalHops;
 }
 
 std::unordered_set<TimeExpandedNetwork::NpuID> TimeExpandedNetwork::backtrack(
@@ -283,8 +283,22 @@ int TimeExpandedNetwork::getRouteHops(const NpuID src, const NpuID dest) const n
         return std::numeric_limits<int>::max();
     }
     
-    // Number of hops = number of edges = number of nodes - 1
-    return static_cast<int>(route.nodes.size()) - 1;
+    // Return logical hop count (Cut-Through switches reduce hop count)
+    return route.logicalHops;
+}
+
+int TimeExpandedNetwork::getRoutePhysicalHops(const NpuID src, const NpuID dest) const noexcept {
+    if (src < 0 || src >= npusCount_ || dest < 0 || dest >= npusCount_) {
+        return std::numeric_limits<int>::max();
+    }
+    
+    const auto& route = routes_[src][dest];
+    if (route.nodes.empty() || route.nodes.size() < 2) {
+        return std::numeric_limits<int>::max();
+    }
+    
+    // Return pre-cached physical hops (computed during route construction)
+    return route.physicalHops;
 }
 
 TimeExpandedNetwork::Time TimeExpandedNetwork::linkTransferTime(const NpuID src,
@@ -366,7 +380,7 @@ void TimeExpandedNetwork::computeEdgeTimes_(const ChunkSize chunkSize) noexcept 
     }
 }
 
-void TimeExpandedNetwork::computeRoutes_(const ChunkSize /*chunkSize*/) noexcept {
+void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
     // Dijkstra per source GPU
     const int N = totalNodes_;
     routes_.assign(npusCount_, std::vector<Route>(npusCount_));
@@ -377,6 +391,74 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize /*chunkSize*/) noexcept
             adj[u].push_back({v, edgeDelta_[u][v]});
         }
     }
+    
+    // Helper to get alpha and beta for an edge
+    auto getEdgeParams = [&](int u, int v) -> std::pair<double, double> {
+        const auto& physLinks = topology_.physLinks();
+        for (const auto& e : physLinks) {
+            if (e.src == u && e.dst == v) {
+                const double alpha = e.alpha;
+                const double bwGiB = std::max(1e-12, (double)e.bw);
+                const double beta = (double)chunkSize / (bwGiB * 1024.0 * 1024.0 * 1024.0) * 1e6;
+                return {alpha, beta};
+            }
+        }
+        return {0, 0};
+    };
+    
+    // Helper to compute route time and logical hops based on switch forwarding mode
+    // Cut-Through switches act as transparent pipelined links
+    auto computeRouteTime = [&](const std::vector<int>& path) -> std::pair<Time, int> {
+        if (path.size() < 2) return {0, 0};
+        
+        Time totalTime = 0;
+        int totalLogicalHops = 0;
+        
+        size_t i = 0;
+        while (i < path.size() - 1) {
+            int u = path[i];
+            int v = path[i + 1];
+            
+            // Check if v is a switch and path continues
+            int switchId = topology_.switchIdFromNode(v);
+            
+            if (switchId >= 0 && i + 2 < path.size()) {
+                // v is a switch, check its forwarding mode
+                int w = path[i + 2]; // next node after switch
+                const auto& sw = topology_.switchAt(switchId);
+                
+                if (sw.forwardingMode == SwitchForwardingMode::CUT_THROUGH) {
+                    // Cut-through switch: acts as transparent pipelined link
+                    // u → SW(CT) → w treated as single logical hop
+                    // Time = max(α₁, α₂) + max(β₁, β₂)
+                    auto [alpha1, beta1] = getEdgeParams(u, v);
+                    auto [alpha2, beta2] = getEdgeParams(v, w);
+                    
+                    double maxAlpha = std::max(alpha1, alpha2);
+                    double maxBeta = std::max(beta1, beta2);
+                    
+                    totalTime += (Time)(maxAlpha + maxBeta);
+                    totalLogicalHops += 1; // Cut-through = 1 logical hop
+                    
+                    i += 2; // Skip both edges (u→v and v→w)
+                } else {
+                    // Store-and-forward switch: cumulative transmission
+                    // Process first edge (u → v)
+                    totalTime += edgeDelta_[u][v];
+                    totalLogicalHops += 1;
+                    i += 1;
+                }
+            } else {
+                // Not a switch or last edge: cumulative
+                totalTime += edgeDelta_[u][v];
+                totalLogicalHops += 1;
+                i += 1;
+            }
+        }
+        
+        return {totalTime, totalLogicalHops};
+    };
+    
     auto reconstruct = [&](int s, int t, const std::vector<int>& prev) {
         Route r;
         if (prev[t] < 0) return r;
@@ -384,14 +466,22 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize /*chunkSize*/) noexcept
         for (int x = t; x != -1; x = prev[x]) path.push_back(x);
         std::reverse(path.begin(), path.end());
         r.nodes = path;
-        r.total = 0;
+        
+        // Compute total time and logical hops based on switch mode
+        auto [totalTime, logicalHops] = computeRouteTime(path);
+        r.total = totalTime;
+        r.logicalHops = logicalHops;
+        r.physicalHops = static_cast<int>(path.size()) - 1; // Cache physical hops
+        
+        // Still store per-edge deltas for reservation purposes
         for (size_t i = 1; i < path.size(); ++i) {
             int u = path[i-1], v = path[i];
             r.deltas.push_back(edgeDelta_[u][v]);
-            r.total += edgeDelta_[u][v];
         }
+        
         return r;
     };
+    
     for (int sGPU = 0; sGPU < npusCount_; ++sGPU) {
         const int s = sGPU; // deviceNode == GPU id
         std::vector<Time> dist(N, std::numeric_limits<Time>::max()/4);

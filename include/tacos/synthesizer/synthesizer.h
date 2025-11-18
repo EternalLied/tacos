@@ -79,6 +79,9 @@ class Synthesizer {
     /// @brief true if chunk c has arrived at NPU n: chunkMap_[c][n] = true
     std::vector<std::vector<bool>> chunkMap_ = {};
 
+    /// @brief Pre-sorted postcondition list (generated once, updated each iteration)
+    std::vector<Condition> sortedPostconditions_ = {};
+    
     /// @brief Random number generator engine
     std::mt19937 randomEngine{std::random_device{}()};
 
@@ -92,6 +95,12 @@ class Synthesizer {
 
     /// @brief Mark chunks in precondition as already at their source NPUs.
     void markPrecondition_() noexcept;
+
+    /// @brief Initialize and sort all postconditions once (called after markPrecondition_)
+    void initializeSortedPostconditions_() noexcept;
+    
+    /// @brief Remove satisfied conditions from sortedPostconditions_ (in-place)
+    void pruneSatisfiedPostconditions_() noexcept;
 
     /// @brief Filter out chunks that have not yet arrived at their destination NPUs.
     /// @return map of destination NPUs -> set of chunks that have not yet arrived
@@ -132,8 +141,10 @@ class Synthesizer {
     /// as occupied with transferring the chunk
     /// @param chunk chunk ID to transfer
     /// @param dest destination NPU ID
+    /// @param backtrackCache cache of backtrack results to avoid repeated computation
     /// @return the selected source NPU (-1 if failed)
-    int linkChunkMatching_(ChunkID chunk, NpuID dest) noexcept;
+    int linkChunkMatching_(ChunkID chunk, NpuID dest, 
+                          std::unordered_map<NpuID, std::unordered_set<NpuID>>& backtrackCache) noexcept;
 
     /// @brief Compare lhs and rhs Time values for equality
     /// @param lhs Time value

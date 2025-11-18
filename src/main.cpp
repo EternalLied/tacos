@@ -7,6 +7,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 *******************************************************************************/
 
 #include <iostream>
+#include <iomanip>
 #include <tacos/collective/all_gather.h>
 #include <tacos/event_queue/timer.h>
 #include <tacos/synthesizer/synthesizer.h>
@@ -29,8 +30,17 @@ int main() {
     const auto latency = 0.5;  // microseconds (us)
     const auto bandwidth = 50;  // GiB/sec
 
-    const auto mesh2d = Mesh2D(width, height, bandwidth, latency);
-    const auto switch_clique = SwitchClique(/*npus*/8, /*BW*/50.0, /*α_g2s*/0.7, /*α_s2g*/0.7);
+    // Build topologies (note: finalizeReachability_() not called yet)
+    auto mesh2d = Mesh2D(width, height, bandwidth, latency);
+    auto switch_clique = SwitchClique(
+        /*npus*/8 
+        ,/*BW*/50.0 
+        ,/*α_g2s*/0.7 
+        ,/*α_s2g*/0.7
+        ,/*allowCopy*/false
+        ,/*maxParallel*/-1
+        ,/*forwardingMode*/SwitchForwardingMode::CUT_THROUGH
+    );
 
     tacos::Topology DGX1_1;
     tacos::BuildDGX1_SingleChassis(DGX1_1, /*bw_gbps*/125.0, /*alpha_us*/0.35, /*allow_copy*/false);
@@ -39,7 +49,7 @@ int main() {
     tacos::BuildDGX2_TwoChassis(DGX2_2, /*allow_copy*/false);
 
     tacos::Topology NDv2_2;
-    tacos::BuildNDv2_FourChassis(NDv2_2, /*allow_copy*/false);
+    tacos::BuildNDv2_TwoChassis(NDv2_2, /*allow_copy*/false);
 
     tacos::Topology NDv2_4;
     tacos::BuildNDv2_FourChassis(NDv2_4, /*allow_copy*/false);
@@ -50,7 +60,13 @@ int main() {
     tacos::Topology AMD_4;
     tacos::BuildAMD_MI250_4Chassis(AMD_4, /*allow_copy*/false);
 
-    const auto topology = switch_clique;
+    // Choose which topology to use (copy it to keep original intact)
+    auto topology = DGX2_2;
+    
+    // Call finalizeReachability_() to compute GPU-to-GPU reachability and backtrack maps
+    // This is essential and must be called before using the topology for scheduling
+    topology.finalizeReachability_();
+    
     const auto npusCount = topology.npusCount();
     std::cout << "NPUs count: " << npusCount << std::endl;
     

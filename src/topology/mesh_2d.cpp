@@ -46,6 +46,5 @@ Mesh2D::Mesh2D(const int width,
         }
     }
 
-    // Finalize reachability to compute GPU->GPU paths via BFS
-    finalizeReachability_();
+    // Note: finalizeReachability_() should be called by the user after topology construction
 }

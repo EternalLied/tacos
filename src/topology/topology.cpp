@@ -101,12 +101,14 @@ int Topology::npusCount() const noexcept {
 
 // ===== multi-switch additions =====
 SwitchID Topology::addSwitch(const std::string& name, bool allowCopy,
-                                       int inCap, int outCap) noexcept {
+                                       int inCap, int outCap, 
+                                       SwitchForwardingMode mode) noexcept {
     Switch sw;
     sw.name = name;
     sw.allowCopy = allowCopy;
     sw.inCap = inCap;
     sw.outCap = outCap;
+    sw.forwardingMode = mode;
     switches_.push_back(sw);
     return switchesCount_++;
 }

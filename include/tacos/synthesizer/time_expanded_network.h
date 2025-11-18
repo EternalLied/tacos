@@ -93,11 +93,17 @@ class TimeExpandedNetwork {
     /// @return vector of node indices representing the path
     [[nodiscard]] std::vector<int> getRoutePath(NpuID src, NpuID dest) const noexcept;
 
-    /// @brief Get the number of hops (edges) in the route from src to dest
+    /// @brief Get the number of logical hops in the route from src to dest
     /// @param src source NPU ID
     /// @param dest destination NPU ID
-    /// @return number of hops in the shortest path
+    /// @return number of logical hops (Cut-Through switches count as 1 hop)
     [[nodiscard]] int getRouteHops(NpuID src, NpuID dest) const noexcept;
+
+    /// @brief Get the number of physical hops (edges) in the route from src to dest
+    /// @param src source NPU ID
+    /// @param dest destination NPU ID
+    /// @return number of physical hops (actual edges traversed)
+    [[nodiscard]] int getRoutePhysicalHops(NpuID src, NpuID dest) const noexcept;
 
     /// @brief Check if a route can be reserved at the current time
     /// @param src source NPU ID
@@ -167,6 +173,8 @@ class TimeExpandedNetwork {
       std::vector<int> nodes;     // node indices u->...->v
       std::vector<Time> deltas;   // per-edge Δ
       Time total = 0;
+      int logicalHops = 0;        // logical hop count (Cut-Through switches reduce hops)
+      int physicalHops = 0;       // physical hop count (actual edges = nodes.size() - 1)
     };
     std::vector<std::vector<Route>> routes_; // [srcGPU][dstGPU]
 

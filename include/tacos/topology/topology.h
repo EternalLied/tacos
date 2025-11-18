@@ -22,6 +22,19 @@ namespace tacos {
   /// Node kind in the physical graph
   enum class NodeKind { Device, Switch };
 
+  /// @brief Switch forwarding mode
+  /// STORE_AND_FORWARD: IB, Ethernet RoCE, multi-chassis IB, multi-tier clos
+  ///   - alpha = alpha1 + alpha2 (cumulative)
+  ///   - beta = beta1 + beta2 (cumulative)
+  /// CUT_THROUGH: NVSwitch (DGX-2, DGX A100, DGX H100 NVL, GH200 NVLink Switch)
+  ///   - alpha = alphaNVLink (counted once)
+  ///   - beta = max(beta1, beta2) (bottleneck, pipelined)
+  ///   - Acts as transparent "smart wire", equivalent to 1 hop
+  enum class SwitchForwardingMode { 
+    STORE_AND_FORWARD,  // Default: cumulative latency and bandwidth
+    CUT_THROUGH         // NVSwitch: pipelined, single-hop equivalent
+  };
+
   /// @brief Switch identifier used by hyper-edge modeling
   using SwitchID = int;
   using NodeIndex = int;  // index into [0, totalNodes_)
@@ -50,6 +63,7 @@ class Topology {
       bool  allowCopy = false;
       int   inCap = -1;   // default = degree
       int   outCap = -1;  // default = degree
+      SwitchForwardingMode forwardingMode = SwitchForwardingMode::STORE_AND_FORWARD;
     };
 
     // ====== Multi-switch physical graph (Switch-Transit) ======
@@ -65,7 +79,8 @@ class Topology {
 
     /// @brief Add a new switch node; returns SwitchID
     SwitchID addSwitch(const std::string& name, bool allowCopy=false,
-                      int inCap=-1, int outCap=-1) noexcept;
+                      int inCap=-1, int outCap=-1, 
+                      SwitchForwardingMode mode=SwitchForwardingMode::STORE_AND_FORWARD) noexcept;
 
     /// @brief Map (device id | switch id) to node index in physical graph
     [[nodiscard]] NodeIndex deviceNode(NpuID d) const noexcept { return d; }
