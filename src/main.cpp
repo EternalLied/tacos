@@ -50,9 +50,13 @@ int main() {
     tacos::Topology AMD_4;
     tacos::BuildAMD_MI250_4Chassis(AMD_4, /*allow_copy*/false);
 
-    const auto topology = mesh2d;
+    const auto topology = switch_clique;
     const auto npusCount = topology.npusCount();
     std::cout << "NPUs count: " << npusCount << std::endl;
+    
+    // print switch count
+    const auto switchCount = topology.switchesCount();
+    std::cout << "Switches count: " << switchCount << std::endl;
 
     // print link statistics
     const auto totalLinks = topology.physLinksCount();

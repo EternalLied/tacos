@@ -26,6 +26,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 
+# MSVC: Set source file encoding to UTF-8 to avoid C4819 warnings
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # Set Output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)

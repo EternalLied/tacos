@@ -132,8 +132,8 @@ class Synthesizer {
     /// as occupied with transferring the chunk
     /// @param chunk chunk ID to transfer
     /// @param dest destination NPU ID
-  // return true if a link-chunk matching was scheduled
-  bool linkChunkMatching_(ChunkID chunk, NpuID dest) noexcept;
+    /// @return the selected source NPU (-1 if failed)
+    int linkChunkMatching_(ChunkID chunk, NpuID dest) noexcept;
 
     /// @brief Compare lhs and rhs Time values for equality
     /// @param lhs Time value

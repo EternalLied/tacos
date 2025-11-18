@@ -8,6 +8,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 
 #include <cassert>
 #include <memory>
+#include <limits>
 #include <tacos/synthesizer/time_expanded_network.h>
 
 using namespace tacos;
@@ -59,6 +60,9 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     computeEdgeTimes_(chunkSize);
     computeRoutes_(chunkSize);
 
+    // Initialize round-used edges tracker
+    roundUsedEdges_.assign(totalNodes_, std::vector<char>(totalNodes_, 0));
+
     for (int u = 0; u < npusCount_; ++u)
       for (int v = 0; v < npusCount_; ++v)
         available_[u][v] = topology_.connected(u, v);
@@ -70,6 +74,21 @@ bool TimeExpandedNetwork::available(const NpuID src, const NpuID dest) const noe
 
     // return true if the link is available at the current timestep
     return available_[src][dest];
+}
+
+int TimeExpandedNetwork::routeHopCount(const NpuID src, const NpuID dest) const noexcept {
+    assert(0 <= src && src < npusCount_);
+    assert(0 <= dest && dest < npusCount_);
+    
+    if (src == dest) return 0;
+    
+    const auto& route = routes_[src][dest];
+    if (route.nodes.empty() || route.nodes.size() < 2) {
+        return -1; // no valid route
+    }
+    
+    // Number of hops = number of edges = nodes.size() - 1
+    return static_cast<int>(route.nodes.size()) - 1;
 }
 
 std::unordered_set<TimeExpandedNetwork::NpuID> TimeExpandedNetwork::backtrack(
@@ -136,6 +155,58 @@ TimeExpandedNetwork::ChunkID TimeExpandedNetwork::chunk(const NpuID src,
     return chunk_[src][dest];
 }
 
+bool TimeExpandedNetwork::canReserveRoute(const NpuID src, const NpuID dest) const noexcept {
+    assert(0 <= src && src < npusCount_);
+    assert(0 <= dest && dest < npusCount_);
+    
+    if (src < 0 || src >= static_cast<int>(routes_.size())) return false;
+    if (dest < 0 || dest >= static_cast<int>(routes_[src].size())) return false;
+    
+    const auto& route = routes_[src][dest];
+    if (route.nodes.empty()) return false;
+    
+    return canReserveRoute_(route, currentTime_);
+}
+
+bool TimeExpandedNetwork::routeHasSwitch(const NpuID src, const NpuID dest) const noexcept {
+    if (src < 0 || src >= static_cast<int>(routes_.size())) return false;
+    if (dest < 0 || dest >= static_cast<int>(routes_[src].size())) return false;
+    const auto& r = routes_[src][dest];
+    if (r.nodes.size() < 2) return false;
+    for (size_t i = 1; i < r.nodes.size(); ++i) {
+        const int u = r.nodes[i-1];
+        const int v = r.nodes[i];
+        const int sid_u = topology_.switchIdFromNode(u);
+        const int sid_v = topology_.switchIdFromNode(v);
+        if (sid_u >= 0 || sid_v >= 0) return true;
+    }
+    return false;
+}
+
+bool TimeExpandedNetwork::routeHasMixedEdges(const NpuID src, const NpuID dest) const noexcept {
+    if (src < 0 || src >= static_cast<int>(routes_.size())) return false;
+    if (dest < 0 || dest >= static_cast<int>(routes_[src].size())) return false;
+    const auto& r = routes_[src][dest];
+    if (r.nodes.size() < 2) return false;
+    bool hasSwitchEdge = false;
+    bool hasDirectEdge = false;
+    for (size_t i = 1; i < r.nodes.size(); ++i) {
+        const int u = r.nodes[i-1];
+        const int v = r.nodes[i];
+        const bool isSwitchEdge = (topology_.switchIdFromNode(u) >= 0) || (topology_.switchIdFromNode(v) >= 0);
+        if (isSwitchEdge) hasSwitchEdge = true; else hasDirectEdge = true;
+        if (hasSwitchEdge && hasDirectEdge) return true;
+    }
+    return false;
+}
+
+void TimeExpandedNetwork::clearRoundUsedEdges() noexcept {
+    // Clear the round-used edges tracker at the start of each timestep matching
+    for (auto& row : roundUsedEdges_) {
+        std::fill(row.begin(), row.end(), 0);
+    }
+}
+
 void TimeExpandedNetwork::transferChunk(const NpuID src,
                                         const NpuID dest,
                                         const ChunkID chunk,
@@ -186,6 +257,34 @@ void TimeExpandedNetwork::transferFinished(const NpuID src, const NpuID dest) no
     //     assert(switchActive_[sid] > 0);
     //     --switchActive_[sid];
     // }
+}
+
+std::vector<int> TimeExpandedNetwork::getRoutePath(const NpuID src, const NpuID dest) const noexcept {
+    assert(0 <= src && src < npusCount_);
+    assert(0 <= dest && dest < npusCount_);
+    
+    if (src >= routes_.size() || dest >= routes_[src].size()) {
+        return {};
+    }
+    
+    return routes_[src][dest].nodes;
+}
+
+int TimeExpandedNetwork::getRouteHops(const NpuID src, const NpuID dest) const noexcept {
+    assert(0 <= src && src < npusCount_);
+    assert(0 <= dest && dest < npusCount_);
+    
+    if (src >= routes_.size() || dest >= routes_[src].size()) {
+        return std::numeric_limits<int>::max();
+    }
+    
+    const auto& route = routes_[src][dest];
+    if (route.nodes.empty() || route.nodes.size() < 2) {
+        return std::numeric_limits<int>::max();
+    }
+    
+    // Number of hops = number of edges = number of nodes - 1
+    return static_cast<int>(route.nodes.size()) - 1;
 }
 
 TimeExpandedNetwork::Time TimeExpandedNetwork::linkTransferTime(const NpuID src,
@@ -261,7 +360,7 @@ void TimeExpandedNetwork::computeEdgeTimes_(const ChunkSize chunkSize) noexcept 
         const double bwGiB = std::max(1e-12, (double)e.bw);
         const double beta_us = (double)chunkSize / (bwGiB * 1024.0 * 1024.0 * 1024.0) * 1e6; // GiB/s -> μs
         const double delta = e.alpha + beta_us;
-        edgeDelta_[e.src][e.dst] = (Time)std::llround(delta);
+        edgeDelta_[e.src][e.dst] = (Time)delta;  // Keep precision, don't round
         hasEdge_[e.src][e.dst] = 1;
         edgeBusyUntil_[e.src][e.dst] = -1;
     }
@@ -344,7 +443,15 @@ bool TimeExpandedNetwork::canReserveRoute_(const Route& r, const Time t0) const 
         const Time d = r.deltas[i-1];
         // link must be free at t
         if (!hasEdge_[u][v]) return false;
-        if (edgeBusyUntil_[u][v] > t) return false;
+        if (edgeBusyUntil_[u][v] > t) {
+            // Edge is busy - route cannot be reserved
+            return false;
+        }
+        // Check if edge was already used in current matching round
+        // (prevents path conflicts within same timestep even at different times)
+        if (roundUsedEdges_[u][v]) {
+            return false;
+        }
         // switch caps at u/v if they are switches
         const int sid_u = topology_.switchIdFromNode(u);
         const int sid_v = topology_.switchIdFromNode(v);
@@ -367,6 +474,8 @@ void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept 
         const Time d = r.deltas[i-1];
         // mark edge busy
         edgeBusyUntil_[u][v] = t + d;
+        // mark edge as used in this matching round
+        roundUsedEdges_[u][v] = 1;
         // switch caps
         const int sid_u = topology_.switchIdFromNode(u);
         const int sid_v = topology_.switchIdFromNode(v);

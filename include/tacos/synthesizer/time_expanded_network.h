@@ -45,6 +45,12 @@ class TimeExpandedNetwork {
     /// @return chunk transfer time in microseconds (us)
     [[nodiscard]] Time linkTransferTime(NpuID src, NpuID dest) const noexcept;
 
+    /// @brief Get the number of hops in the route from src to dest
+    /// @param src source NPU ID
+    /// @param dest destination NPU ID
+    /// @return number of hops (edges) in the route, or -1 if no route exists
+    [[nodiscard]] int routeHopCount(NpuID src, NpuID dest) const noexcept;
+
     /// @brief Backtrack the TEN and return the list of available source NPUs to dest
     /// @param dest destination NPU ID
     /// @return list of source NPUs available at current timestep
@@ -80,6 +86,41 @@ class TimeExpandedNetwork {
     /// @param src source NPU ID
     /// @param dest destination NPU ID
     void transferFinished(NpuID src, NpuID dest) noexcept;
+
+    /// @brief Get the route (path) from src to dest
+    /// @param src source NPU ID
+    /// @param dest destination NPU ID
+    /// @return vector of node indices representing the path
+    [[nodiscard]] std::vector<int> getRoutePath(NpuID src, NpuID dest) const noexcept;
+
+    /// @brief Get the number of hops (edges) in the route from src to dest
+    /// @param src source NPU ID
+    /// @param dest destination NPU ID
+    /// @return number of hops in the shortest path
+    [[nodiscard]] int getRouteHops(NpuID src, NpuID dest) const noexcept;
+
+    /// @brief Check if a route can be reserved at the current time
+    /// @param src source NPU ID
+    /// @param dest destination NPU ID
+    /// @return true if the route is available, false otherwise
+    [[nodiscard]] bool canReserveRoute(NpuID src, NpuID dest) const noexcept;
+
+    /// @brief Clear the current-round used edges set (call at start of each timestep matching)
+    void clearRoundUsedEdges() noexcept;
+
+  /// @brief Whether the underlying topology has any switches
+  [[nodiscard]] bool hasSwitches() const noexcept { return topology_.switchesCount() > 0; }
+
+  /// @brief Whether a node index is a switch node
+  [[nodiscard]] bool nodeIsSwitch(int nodeIndex) const noexcept {
+    return topology_.switchIdFromNode(nodeIndex) >= 0;
+  }
+
+  /// @brief Whether the precomputed shortest route between GPUs traverses any switch
+  [[nodiscard]] bool routeHasSwitch(NpuID src, NpuID dest) const noexcept;
+
+  /// @brief Whether the route contains both direct device-to-device edges and switch edges
+  [[nodiscard]] bool routeHasMixedEdges(NpuID src, NpuID dest) const noexcept;
 
   private:
     /// @brief current timestep
@@ -128,6 +169,10 @@ class TimeExpandedNetwork {
       Time total = 0;
     };
     std::vector<std::vector<Route>> routes_; // [srcGPU][dstGPU]
+
+    // Track edges used in current matching round to prevent path conflicts
+    // within the same timestep (even if used at different times)
+    std::vector<std::vector<char>> roundUsedEdges_; // [u][v] = 1 if edge used this round
 
     // helpers
     void computeEdgeTimes_(ChunkSize chunkSize) noexcept;
