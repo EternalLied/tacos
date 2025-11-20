@@ -14,6 +14,13 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 
 namespace tacos {
 
+/// @brief Collective type enum
+enum class CollectiveType {
+    ALL_GATHER,
+    ALL_TO_ALL,
+    UNKNOWN
+};
+
 /// @brief Abstract base class for collective communication patterns
 class Collective {
   public:
@@ -28,6 +35,9 @@ class Collective {
 
     /// @brief Base class constructor for collective pattern
     Collective() noexcept;
+    
+    /// @brief Virtual destructor
+    virtual ~Collective() = default;
 
     /// @brief Return the source NPU for a given chunk
     /// @param chunk chunk ID
@@ -42,6 +52,10 @@ class Collective {
     /// @brief Get the number of chunks in this collective
     /// @return number of chunks in the collective pattern
     [[nodiscard]] int chunksCount() const noexcept;
+    
+    /// @brief Get the type of this collective
+    /// @return collective type
+    [[nodiscard]] virtual CollectiveType getType() const noexcept { return CollectiveType::UNKNOWN; }
 
   protected:
     /// @brief Number of chunks in the collective

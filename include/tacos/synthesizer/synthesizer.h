@@ -45,6 +45,35 @@ class Synthesizer {
                              const Collective& collective,
                              ChunkSize chunkSize) noexcept;
 
+    /// @brief Calculate link utilization statistics (excluding switch-to-switch links)
+    /// @param topology Target network topology
+    /// @return average link utilization as a percentage (0-100)
+    [[nodiscard]] double calculateLinkUtilization(const Topology& topology) const noexcept;
+
+    /// @brief Multi-round synthesis result
+    struct MultiRoundResult {
+        std::unique_ptr<Synthesizer> bestSynthesizer;  // Use unique_ptr to avoid incomplete type issue
+        Time bestCollectiveTime;
+        int bestRound;
+        int totalRounds;
+        double totalSynthesisTime;  // in microseconds
+        bool interrupted;
+    };
+
+    /// @brief Run multiple rounds of synthesis to find best result
+    /// @param topology Target network topology
+    /// @param collective Target collective pattern
+    /// @param chunkSize Size of each chunk (in bytes)
+    /// @param maxNoImprovementRounds Stop after this many rounds without improvement
+    /// @param interruptFlag Atomic flag to check for user interruption
+    /// @return Multi-round synthesis result
+    [[nodiscard]] static MultiRoundResult solveMultiRound(
+        const Topology& topology,
+        const Collective& collective,
+        ChunkSize chunkSize,
+        int maxNoImprovementRounds,
+        const std::atomic<bool>& interruptFlag) noexcept;
+
   private:
     /// @brief Map of destination NPU -> set of unsatisfied chunk IDs.
     using PostconditionMap = std::unordered_map<NpuID, std::unordered_set<ChunkID>>;
@@ -57,6 +86,9 @@ class Synthesizer {
 
     /// @brief Target collective pattern to synthesize.
     const Collective* collective_ = nullptr;
+    
+    /// @brief Type of the collective being synthesized
+    CollectiveType collectiveType_ = CollectiveType::UNKNOWN;
 
     /// @brief Number of NPUs in the topology.
     int npusCount = -1;

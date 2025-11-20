@@ -14,15 +14,17 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 
 namespace tacos {
 
-/// @brief All-Gather collective communication pattern
-class AllGather final : public Collective {
+/// @brief All-to-All collective communication pattern
+/// In All-to-All, each NPU has N chunks (one for each destination NPU)
+/// Each NPU sends its i-th chunk to NPU i
+class AllToAll final : public Collective {
   public:
-    /// @brief Constructor for AllGather collective
+    /// @brief Constructor for AllToAll collective
     /// @param npusCount number of NPUs in the topology
-    /// @param collectivesCount number of initial chunks per each NPU
-    explicit AllGather(int npusCount, int collectivesCount = 1) noexcept;
+    /// @param collectivesCount number of rounds of all-to-all operations (default 1)
+    explicit AllToAll(int npusCount, int collectivesCount = 1) noexcept;
     
     /// @brief Get the type of this collective
-    [[nodiscard]] CollectiveType getType() const noexcept override { return CollectiveType::ALL_GATHER; }
+    [[nodiscard]] CollectiveType getType() const noexcept override { return CollectiveType::ALL_TO_ALL; }
 };
 }  // namespace tacos

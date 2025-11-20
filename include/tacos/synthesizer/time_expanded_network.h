@@ -105,6 +105,13 @@ class TimeExpandedNetwork {
     /// @return number of physical hops (actual edges traversed)
     [[nodiscard]] int getRoutePhysicalHops(NpuID src, NpuID dest) const noexcept;
 
+    /// @brief Calculate link utilization for a given link
+    /// @param src source node ID
+    /// @param dest destination node ID
+    /// @param totalTime total collective time
+    /// @return utilization ratio (0.0 to 1.0)
+    [[nodiscard]] double getLinkUtilization(int src, int dest, Time totalTime) const noexcept;
+
     /// @brief Check if a route can be reserved at the current time
     /// @param src source NPU ID
     /// @param dest destination NPU ID
@@ -159,6 +166,9 @@ class TimeExpandedNetwork {
     std::vector<std::vector<Time>> edgeBusyUntil_; // sized [totalNodes_][totalNodes_], -1 if no edge
     std::vector<std::vector<Time>> edgeDelta_;     // per-edge α+β·n (μs); -1 if no edge
     std::vector<std::vector<char>> hasEdge_;       // quick check
+    
+    // Physical edge utilization tracking (for statistics)
+    std::vector<std::vector<Time>> edgeAccumulatedBusyTime_; // total busy time for utilization stats
 
     // per-switch in/out concurrent usage calendars: intervals [start,end)
     struct Interval { Time s, e; };

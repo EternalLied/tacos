@@ -19,6 +19,7 @@ add_library(tacos
 
     collective/collective.cpp ${CMAKE_SOURCE_DIR}/include/tacos/collective/collective.h
     collective/all_gather.cpp ${CMAKE_SOURCE_DIR}/include/tacos/collective/all_gather.h
+    collective/all_to_all.cpp ${CMAKE_SOURCE_DIR}/include/tacos/collective/all_to_all.h
     event_queue/event_queue.cpp ${CMAKE_SOURCE_DIR}/include/tacos/event_queue/event_queue.h
     event_queue/timer.cpp ${CMAKE_SOURCE_DIR}/include/tacos/event_queue/timer.h
     synthesizer/time_expanded_network.cpp ${CMAKE_SOURCE_DIR}/include/tacos/synthesizer/time_expanded_network.h
@@ -32,6 +33,8 @@ target_include_directories(tacos
 # TACOS executable
 add_executable(tacos_exec
     main.cpp
+    theoretical_bound.cpp theoretical_bound.h
+    topology_factory.cpp topology_factory.h
 )
 target_link_libraries(tacos_exec PRIVATE tacos)
 set_target_properties(tacos_exec PROPERTIES OUTPUT_NAME tacos)

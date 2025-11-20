@@ -31,6 +31,7 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     edgeBusyUntil_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
     edgeDelta_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
     hasEdge_.assign(totalNodes_, std::vector<char>(totalNodes_, 0));
+    edgeAccumulatedBusyTime_.assign(totalNodes_, std::vector<Time>(totalNodes_, 0));
 
     // per-switch caps & calendars
     swInCap_.assign(topology_.switchesCount(), 0);
@@ -256,6 +257,21 @@ int TimeExpandedNetwork::getRoutePhysicalHops(const NpuID src, const NpuID dest)
     
     // Return pre-cached physical hops (computed during route construction)
     return route.physicalHops;
+}
+
+double TimeExpandedNetwork::getLinkUtilization(const int src, const int dest, const Time totalTime) const noexcept {
+    if (totalTime <= 0) {
+        return 0.0;
+    }
+    
+    if (src < 0 || src >= static_cast<int>(edgeAccumulatedBusyTime_.size()) || 
+        dest < 0 || dest >= static_cast<int>(edgeAccumulatedBusyTime_[src].size())) {
+        return 0.0;
+    }
+    
+    // Use accumulated busy time for physical edge utilization
+    const Time busyTime = edgeAccumulatedBusyTime_[src][dest];
+    return static_cast<double>(busyTime) / static_cast<double>(totalTime);
 }
 
 TimeExpandedNetwork::Time TimeExpandedNetwork::linkTransferTime(const NpuID src,
@@ -511,6 +527,8 @@ void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept 
         const Time d = r.deltas[i-1];
         // mark edge busy
         edgeBusyUntil_[u][v] = t + d;
+        // Accumulate busy time for this physical edge
+        edgeAccumulatedBusyTime_[u][v] += d;
         // mark edge as used in this matching round
         roundUsedEdges_[u][v] = 1;
         // switch caps

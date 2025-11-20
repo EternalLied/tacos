@@ -12,6 +12,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <limits>
 #include <algorithm>
 #include <map>
+#include <chrono>
 #include <tacos/synthesizer/synthesizer.h>
 #include <tacos/event_queue/timer.h>
 #include "log.h"
@@ -55,9 +56,7 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
 #ifdef ENABLE_PERF_STATS
     initTimer.stop();
     auto totalInitTime = initTimer.time();
-#endif
-    
-    // then, repeat the link-chunk matching process
+#endif    // then, repeat the link-chunk matching process
     while (!eventQueue_.empty()) {
         PerfLog(++iterationCount);
         
@@ -171,6 +170,36 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
         DebugLog(std::cout << std::endl);
     }
 
+    // Check if all postconditions were satisfied
+    if (!sortedPostconditions_.empty()) {
+        std::cerr << std::endl;
+        std::cerr << "========================================" << std::endl;
+        std::cerr << "ERROR: Scheduling failed!" << std::endl;
+        std::cerr << "Event queue is empty but " << sortedPostconditions_.size() 
+                  << " postcondition(s) remain unsatisfied." << std::endl;
+        std::cerr << "Collective type: " << (collectiveType_ == CollectiveType::ALL_GATHER ? "AllGather" : 
+                                              collectiveType_ == CollectiveType::ALL_TO_ALL ? "AllToAll" : "Unknown") << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Possible causes:" << std::endl;
+        std::cerr << "  1. Topology connectivity: Some NPU pairs are not reachable" << std::endl;
+        std::cerr << "  2. Routing policy: Current policy blocks required routes" << std::endl;
+        if (collectiveType_ == CollectiveType::ALL_GATHER) {
+            std::cerr << "  3. AllGather policy: Only allows 1-hop routes in non-switch topologies" << std::endl;
+        }
+        std::cerr << std::endl;
+        std::cerr << "Unsatisfied postconditions (first 10):" << std::endl;
+        int count = 0;
+        for (const auto& [chunk, dest] : sortedPostconditions_) {
+            if (count >= 10) break;
+            auto src = collective_->precondition(chunk);
+            std::cerr << "  Chunk " << chunk << ": GPU" << src << " -> GPU" << dest << std::endl;
+            ++count;
+        }
+        std::cerr << "========================================" << std::endl;
+        std::cerr << std::endl;
+        return -1;  // Return error value
+    }
+
     // === Print Performance Summary ===
     PerfLog(
         solveTimer.stop();
@@ -220,6 +249,7 @@ void Synthesizer::initialize_(const Topology& topology,
     // set topology and collective
     topology_ = &topology;
     collective_ = &collective;
+    collectiveType_ = collective.getType();
 
     // set variables
     npusCount = topology_->npusCount();
@@ -573,16 +603,34 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
         // skip invalid routes
         if (hopCount < 0) continue;
 
-        // Policy enforcement (per-route):
-        // 1) If topology has no switches, only schedule 1-hop routes
-        if (!ten_->hasSwitches() && hopCount != 1) continue;
-
-        // 2) If the route's shortest path does not traverse any switch, require 1-hop
+        // Policy enforcement (per-route) - different strategies for different collectives
+        const bool hasSwitchInTopology = ten_->hasSwitches();
         const bool routeThroughSwitch = ten_->routeHasSwitch(src, dest);
-        if (!routeThroughSwitch && hopCount != 1) continue;
+        const bool hasMixedEdges = ten_->routeHasMixedEdges(src, dest);
+        
+        if (collectiveType_ == CollectiveType::ALL_GATHER) {
+            // === AllGather: Strict routing policy (original) ===
+            // 1) If topology has no switches, only schedule 1-hop routes
+            if (!hasSwitchInTopology && hopCount != 1) continue;
 
-        // 3) Do not match routes that mix direct device edges with switch edges
-        if (ten_->routeHasMixedEdges(src, dest)) continue;
+            // 2) If the route's shortest path does not traverse any switch, require 1-hop
+            if (!routeThroughSwitch && hopCount != 1) continue;
+
+            // 3) Do not match routes that mix direct device edges with switch edges
+            if (hasMixedEdges) continue;
+            
+        } else if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
+            // === AllToAll: Relaxed routing policy ===
+            // Allow multi-hop routes and mixed edges for better connectivity
+            // This is necessary for topologies like mesh where not all NPU pairs are directly connected
+            // No restrictions on hop count or edge mixing
+            
+        } else {
+            // === Unknown collective: Use conservative AllGather policy ===
+            if (!hasSwitchInTopology && hopCount != 1) continue;
+            if (!routeThroughSwitch && hopCount != 1) continue;
+            if (hasMixedEdges) continue;
+        }
 
         // Priority 1: Prefer routes with fewer hops (better link utilization)
         if (hopCount < minHopCount) {
@@ -641,3 +689,95 @@ bool Synthesizer::isEqual(const Time lhs, const Time rhs) noexcept {
     constexpr Time epsilon = 1e-9;
     return std::abs(lhs - rhs) < epsilon;
 }
+
+double Synthesizer::calculateLinkUtilization(const Topology& topology) const noexcept {
+    if (!ten_ || collectiveTime_ <= 0) {
+        return 0.0;
+    }
+    
+    const int npusCount = topology.npusCount();
+    const auto& physLinks = topology.physLinks();
+    
+    // Calculate utilization for physical links (excluding switch-to-switch)
+    double totalUtilization = 0.0;
+    int linkCount = 0;
+    
+    for (const auto& link : physLinks) {
+        const bool srcIsDevice = (link.src < npusCount);
+        const bool dstIsDevice = (link.dst < npusCount);
+        
+        // Skip switch-to-switch links (both src and dst are switches)
+        if (!srcIsDevice && !dstIsDevice) {
+            continue;
+        }
+        
+        // Get accumulated busy time for this physical edge
+        double linkUtilization = ten_->getLinkUtilization(link.src, link.dst, collectiveTime_);
+        
+        totalUtilization += linkUtilization;
+        linkCount++;
+    }
+    
+    if (linkCount == 0) {
+        return 0.0;
+    }
+    
+    // Return average utilization as percentage
+    return (totalUtilization / linkCount) * 100.0;
+}
+
+Synthesizer::MultiRoundResult Synthesizer::solveMultiRound(
+    const Topology& topology,
+    const Collective& collective,
+    ChunkSize chunkSize,
+    int maxNoImprovementRounds,
+    const std::atomic<bool>& interruptFlag) noexcept {
+    
+    MultiRoundResult result;
+    result.bestSynthesizer = nullptr;
+    result.bestCollectiveTime = std::numeric_limits<Time>::max();
+    result.bestRound = 0;
+    result.totalRounds = 0;
+    result.totalSynthesisTime = 0.0;
+    result.interrupted = false;
+    
+    int noImprovementCount = 0;
+    
+    while (true) {
+        ++result.totalRounds;
+        
+        if (interruptFlag.load()) {
+            result.interrupted = true;
+            break;
+        }
+        
+        // Run one round of synthesis
+        auto synthesizer = std::make_unique<Synthesizer>();
+        
+        // Measure synthesis time
+        auto startTime = std::chrono::high_resolution_clock::now();
+        auto collectiveTime = synthesizer->solve(topology, collective, chunkSize);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        
+        auto roundTime = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        result.totalSynthesisTime += roundTime;
+        
+        // Check if this is the best result
+        if (collectiveTime < result.bestCollectiveTime) {
+            result.bestCollectiveTime = collectiveTime;
+            result.bestRound = result.totalRounds;
+            result.bestSynthesizer = std::move(synthesizer);
+            noImprovementCount = 0;
+        } else {
+            noImprovementCount++;
+            
+            // Early stopping if no improvement for several rounds
+            if (noImprovementCount >= maxNoImprovementRounds) {
+                break;
+            }
+        }
+    }
+    
+    return result;
+}
+
