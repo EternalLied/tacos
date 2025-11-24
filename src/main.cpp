@@ -104,17 +104,22 @@ int main(int argc, char* argv[]) {
     
     std::unique_ptr<Collective> collective;
     Collective::ChunkSize chunkSize;
+    Collective::ChunkSize totalDataSize;  // Total data size for bandwidth calculation
     
     if (collectiveName == "allgather") {
         std::cout << "Selected collective: AllGather" << std::endl;
         collective = std::make_unique<AllGather>(npusCount, collectivesCount);
         chunkSize = outputBufferSize / (npusCount * collectivesCount);
+        // For AllGather, total data size is the output buffer size per NPU
+        totalDataSize = outputBufferSize;
     } else if (collectiveName == "alltoall") {
         std::cout << "Selected collective: AllToAll" << std::endl;
         collective = std::make_unique<AllToAll>(npusCount, collectivesCount);
         // For AllToAll, each NPU sends N chunks (one to each NPU)
         // Total data per NPU = outputBufferSize, divided into N chunks
         chunkSize = outputBufferSize / npusCount;
+        // For AllToAll, total data size is the output buffer size per NPU
+        totalDataSize = outputBufferSize;
     } else {
         std::cerr << "Error: Unknown collective '" << collectiveName << "'" << std::endl;
         std::cerr << "Available collectives: allgather, alltoall" << std::endl;
@@ -124,6 +129,7 @@ int main(int argc, char* argv[]) {
     const auto chunksCount = collective->chunksCount();
     std::cout << "Chunks count: " << chunksCount << std::endl;
     std::cout << "Each chunk size: " << chunkSize << " bytes" << std::endl;
+    std::cout << "Total data size: " << totalDataSize / (1 << 20) << " MiB" << std::endl;
     
     DebugLog(std::cout << std::endl);
 
@@ -151,11 +157,19 @@ int main(int argc, char* argv[]) {
             linkUtilization = result.bestSynthesizer->calculateLinkUtilization(topology);
         }
         
+        // Calculate algorithm bandwidth (GB/s)
+        // Bandwidth = Total data size (bytes) / Time (us) * 1e6 (us to s) / 1e9 (bytes to GB)
+        //           = Total data size / Time / 1000
+        double algoBandwidth = (result.bestCollectiveTime > 0.0) ? 
+            (static_cast<double>(totalDataSize) / result.bestCollectiveTime / 1000.0) : 0.0;
+        
         std::cout << "=== Multi-Round Synthesis Summary ===" << std::endl;
         std::cout << "Completed rounds: " << result.totalRounds << std::endl;
-                std::cout << "Average synthesis time: " << result.totalSynthesisTime / 1000 / result.totalRounds << " ms" << std::endl;
+        std::cout << "Average synthesis time: " << result.totalSynthesisTime / 1000 / result.totalRounds << " ms" << std::endl;
         std::cout << "Best collective time: " << result.bestCollectiveTime 
                   << " us (found at round " << result.bestRound << ")" << std::endl;
+        std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2) 
+                  << algoBandwidth << " GB/s" << std::endl;
         std::cout << "Average link utilization: " << std::fixed << std::setprecision(2) 
                   << linkUtilization << "%" << std::endl;
         
@@ -177,9 +191,17 @@ int main(int argc, char* argv[]) {
         // Calculate link utilization
         auto linkUtilization = synthesizer.calculateLinkUtilization(topology);
         
+        // Calculate algorithm bandwidth (GB/s)
+        // Bandwidth = Total data size (bytes) / Time (us) * 1e6 (us to s) / 1e9 (bytes to GB)
+        //           = Total data size / Time / 1000
+        double algoBandwidth = (collectiveTime > 0.0) ? 
+            (static_cast<double>(totalDataSize) / collectiveTime / 1000.0) : 0.0;
+        
         std::cout << std::endl;
         std::cout << "Time to solve: " << time / 1000 << " ms" << std::endl;
         std::cout << "Collective Time: " << collectiveTime << " us" << std::endl;
+        std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2) 
+                  << algoBandwidth << " GB/s" << std::endl;
         std::cout << "Average link utilization: " << std::fixed << std::setprecision(2) 
                   << linkUtilization << "%" << std::endl;
     }

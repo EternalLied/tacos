@@ -15,7 +15,9 @@ add_library(tacos
     topology/torus_3d.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/torus_3d.h
     topology/hypercube_3d.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/hypercube_3d.h
     topology/switch_clique.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/switch_clique.h
-    topology/multichassis_presets.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/multichassis_presets.h
+    topology/dgx_topologies.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/dgx_topologies.h
+    topology/ndv2_topologies.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/ndv2_topologies.h
+    topology/amd_topologies.cpp ${CMAKE_SOURCE_DIR}/include/tacos/topology/amd_topologies.h
 
     collective/collective.cpp ${CMAKE_SOURCE_DIR}/include/tacos/collective/collective.h
     collective/all_gather.cpp ${CMAKE_SOURCE_DIR}/include/tacos/collective/all_gather.h
