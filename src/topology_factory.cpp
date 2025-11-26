@@ -24,7 +24,7 @@ std::optional<Topology> createTopology(const std::string& topologyName) {
         // Mesh 2D
         {"mesh2d", []() {
             const auto width = 4;
-            const auto height = 3;
+            const auto height = 4;
             const auto latency = 0.5;  // microseconds (us)
             const auto bandwidth = 50;  // GiB/sec
             return Mesh2D(width, height, bandwidth, latency);
