@@ -312,9 +312,14 @@ void Synthesizer::initializeSortedPostconditions_() noexcept {
     }
     
     // Sort by physical hop count
+    // Strategy depends on collective type:
+    // - AllGather: Ascending (short paths first) - no intermediate caching needed
+    // - AllToAll: Descending (long paths first) - benefits from progressive intermediate caching
+    const bool useDescendingOrder = (collectiveType_ == CollectiveType::ALL_TO_ALL);
+    
     std::stable_sort(conditionsWithHops.begin(), conditionsWithHops.end(),
-        [](const auto& a, const auto& b) {
-            return a.second < b.second;
+        [useDescendingOrder](const auto& a, const auto& b) {
+            return useDescendingOrder ? (a.second > b.second) : (a.second < b.second);
         });
     
     // Shuffle within same-hop groups
@@ -403,9 +408,14 @@ std::vector<Synthesizer::Condition> Synthesizer::shufflePostcondition_(
     }
     
     // Step 2: Sort by physical hop count (using precomputed values)
+    // Strategy depends on collective type:
+    // - AllGather: Ascending (short paths first) - no intermediate caching needed
+    // - AllToAll: Descending (long paths first) - benefits from progressive intermediate caching
+    const bool useDescendingOrder = (collectiveType_ == CollectiveType::ALL_TO_ALL);
+    
     std::stable_sort(conditionsWithHops.begin(), conditionsWithHops.end(),
-        [](const auto& a, const auto& b) {
-            return a.second < b.second;
+        [useDescendingOrder](const auto& a, const auto& b) {
+            return useDescendingOrder ? (a.second > b.second) : (a.second < b.second);
         });
     
     // Step 3: Shuffle within same-hop groups (using precomputed values)
@@ -487,23 +497,39 @@ std::pair<int, int> Synthesizer::expandTenTimestep_(PostconditionMap* const post
 
             // for case 2, check if the chunk has already arrived at dest
             // by following other paths
-            // and if so, check if we can replace this path with another chun
+            // and if so, check if we can replace this path with another chunk
             if (chunkMap_[chunk][dest]) {
-                // dest has already received this chunk
-                // so check the replacement candidates
-                const auto replacementChunk = findReplacementChunk_(src, dest, postconditionMap);
+                // Check if dest is actually a final destination for this chunk
+                // For AllToAll: dest might just be an intermediate node, not the final target
+                // For AllGather: all nodes are final destinations
+                const auto& postconditions = collective_->postcondition(chunk);
+                const bool isActualDestination = std::find(
+                    postconditions.begin(), 
+                    postconditions.end(), 
+                    dest
+                ) != postconditions.end();
+                
+                if (isActualDestination) {
+                    // dest is a final destination and has already received this chunk
+                    // so we can replace it with another chunk that dest needs
+                    const auto replacementChunk = findReplacementChunk_(src, dest, postconditionMap);
 
-                if (!replacementChunk.has_value()) {
-                    // no replacement candidate found
-                    // just mark this TEN link as available and skip
-                    ten_->transferFinished(src, dest);
-                    ++discardedCount;
-                    continue;
+                    if (!replacementChunk.has_value()) {
+                        // no replacement candidate found
+                        // just mark this TEN link as available and skip
+                        ten_->transferFinished(src, dest);
+                        ++discardedCount;
+                        continue;
+                    }
+
+                    // replacement candidate found
+                    chunk = replacementChunk.value();
+                    ++replacedCount;
+                } else {
+                    // dest is just an intermediate node (for AllToAll multi-hop routing)
+                    // The chunk should continue to its final destination
+                    // Do NOT replace it - let it proceed normally
                 }
-
-                // replacement candidate found
-                chunk = replacementChunk.value();
-                ++replacedCount;
             }
 
             // a meaningful chunk (regardless of replacement) has arrived at dest
@@ -662,6 +688,41 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
     // Try candidates in shuffled order until we find one with an available physical route
     // (routes may become unavailable between backtrack() call and actual reservation)
     for (const auto selectedSrc : candidates) {
+        // === AllToAll multi-hop optimization ===
+        // For AllToAll with multi-hop routes crossing intermediate devices,
+        // only reserve the segment to the first intermediate device to avoid
+        // occupying too many links in a single timestep
+        if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
+            const int intermediateDevice = ten_->getFirstIntermediateDevice(selectedSrc, dest);
+            
+            if (intermediateDevice >= 0) {
+                // Multi-hop route with intermediate device found
+                // Check only the partial route (src -> intermediate) availability
+                if (!ten_->canReserveRoute(selectedSrc, intermediateDevice)) {
+                    continue;  // Partial route not available, try next candidate
+                }
+                
+                // Reserve only src -> intermediate segment
+                const auto intermediateArrivalTime = currentTime_ + ten_->linkTransferTime(selectedSrc, intermediateDevice);
+                
+                // DebugLog(
+                //     std::cout << "  [DEBUG] AllToAll partial: Chunk " << chunk 
+                //               << " GPU" << selectedSrc << " -> GPU" << intermediateDevice 
+                //               << " (intermediate, final dest: GPU" << dest << ")" << std::endl;
+                // );
+                
+                ten_->transferChunkPartial(selectedSrc, intermediateDevice, chunk, intermediateArrivalTime);
+                eventQueue_.schedule(intermediateArrivalTime);
+                
+                // Update chunkMap to reflect chunk now at intermediate device
+                // This allows the intermediate device to serve as a source for subsequent hops
+                chunkMap_[chunk][intermediateDevice] = true;
+                
+                return selectedSrc;
+            }
+        }
+        
+        // === Standard full route check (AllGather or direct routes) ===
         // Final check: verify physical route is still available
         if (!ten_->canReserveRoute(selectedSrc, dest)) {
             continue;  // Route no longer available, try next candidate

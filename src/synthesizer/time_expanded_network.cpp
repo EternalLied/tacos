@@ -9,6 +9,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <cassert>
 #include <memory>
 #include <limits>
+#include <random>
 #include <tacos/synthesizer/time_expanded_network.h>
 
 using namespace tacos;
@@ -274,6 +275,58 @@ double TimeExpandedNetwork::getLinkUtilization(const int src, const int dest, co
     return static_cast<double>(busyTime) / static_cast<double>(totalTime);
 }
 
+int TimeExpandedNetwork::getFirstIntermediateDevice(const NpuID src, const NpuID dest) const noexcept {
+    if (src < 0 || src >= npusCount_ || dest < 0 || dest >= npusCount_) {
+        return -1;
+    }
+    
+    const auto& route = routes_[src][dest];
+    if (route.nodes.size() < 3) {
+        // No intermediate nodes (direct connection or too short)
+        return -1;
+    }
+    
+    // Search for first intermediate device node (excluding src and dest)
+    for (size_t i = 1; i < route.nodes.size() - 1; ++i) {
+        int nodeIdx = route.nodes[i];
+        // Check if this node is a device (not a switch)
+        if (nodeIdx < npusCount_) {
+            return nodeIdx;
+        }
+    }
+    
+    return -1; // No intermediate device found
+}
+
+void TimeExpandedNetwork::transferChunkPartial(const NpuID src, 
+                                               const int intermediate, 
+                                               const ChunkID chunk,
+                                               const Time time) noexcept {
+    assert(0 <= src && src < npusCount_);
+    assert(0 <= intermediate && intermediate < npusCount_);
+    assert(chunk >= 0);
+    assert(time >= currentTime_);
+    
+    // Use the precomputed route from src to intermediate
+    if (src >= static_cast<int>(routes_.size()) || 
+        intermediate >= static_cast<int>(routes_[src].size())) {
+        return; // Invalid route indices
+    }
+    
+    const auto& partialRoute = routes_[src][intermediate];
+    if (partialRoute.nodes.empty()) {
+        return; // No route available
+    }
+    
+    // Reserve the partial route's physical resources
+    reserveRoute_(partialRoute, currentTime_);
+    
+    // Mark virtual link src->intermediate as busy
+    available_[src][intermediate] = false;
+    chunk_[src][intermediate] = chunk;
+    linkBusyUntil_[src][intermediate] = time;
+}
+
 TimeExpandedNetwork::Time TimeExpandedNetwork::linkTransferTime(const NpuID src,
                                                                 const NpuID dest) const noexcept {
     assert(0 <= src && src < npusCount_);
@@ -445,6 +498,11 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
         return r;
     };
     
+    // Random number generator for path selection (to explore different equal-cost paths)
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> dis(0.0, 1.0);
+    
     for (int sGPU = 0; sGPU < npusCount_; ++sGPU) {
         const int s = sGPU; // deviceNode == GPU id
         std::vector<Time> dist(N, std::numeric_limits<Time>::max()/4);
@@ -452,11 +510,30 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
         using QN = std::pair<Time,int>;
         std::priority_queue<QN, std::vector<QN>, std::greater<QN>> pq;
         dist[s] = 0; pq.push({0,s});
+        
+        // Epsilon for floating-point comparison
+        constexpr Time epsilon = 1e-9;
+        
         while(!pq.empty()) {
             auto [du,u] = pq.top(); pq.pop();
-            if (du != dist[u]) continue;
+            if (du > dist[u] + epsilon) continue;  // Use epsilon comparison
+            
             for (auto [v,w] : adj[u]) {
-                if (dist[v] > du + w) { dist[v] = du + w; prev[v] = u; pq.push({dist[v], v}); }
+                Time newDist = du + w;
+                
+                if (dist[v] > newDist + epsilon) {
+                    // Found strictly better path
+                    dist[v] = newDist; 
+                    prev[v] = u; 
+                    pq.push({dist[v], v});
+                } else if (std::abs(dist[v] - newDist) <= epsilon) {
+                    // Found equal-cost path - randomly decide whether to replace
+                    // This allows exploring different equal-cost paths across multiple runs
+                    if (dis(gen) < 0.5) {
+                        prev[v] = u;  // Replace with new path with 50% probability
+                    }
+                    // Note: We don't push to pq again since distance didn't improve
+                }
             }
         }
         for (int tGPU = 0; tGPU < npusCount_; ++tGPU) {

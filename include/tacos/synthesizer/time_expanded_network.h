@@ -118,6 +118,20 @@ class TimeExpandedNetwork {
     /// @return true if the route is available, false otherwise
     [[nodiscard]] bool canReserveRoute(NpuID src, NpuID dest) const noexcept;
 
+    /// @brief Find the first intermediate device node in a route (for partial reservation)
+    /// @param src source NPU ID
+    /// @param dest destination NPU ID
+    /// @return node index of first intermediate device, or -1 if no intermediate device
+    [[nodiscard]] int getFirstIntermediateDevice(NpuID src, NpuID dest) const noexcept;
+
+    /// @brief Transfer chunk using partial route (only to first intermediate device)
+    /// @details For AllToAll multi-hop optimization: reserve only src->intermediate segment
+    /// @param src source NPU ID
+    /// @param intermediate intermediate device node
+    /// @param chunk chunk ID being transferred
+    /// @param time arrival time at intermediate node
+    void transferChunkPartial(NpuID src, int intermediate, ChunkID chunk, Time time) noexcept;
+
     /// @brief Clear the current-round used edges set (call at start of each timestep matching)
     void clearRoundUsedEdges() noexcept;
 

@@ -97,11 +97,11 @@ int main(int argc, char* argv[]) {
     // Parse command line arguments
     // Usage: tacos <topology> <collective> [data_size] [multi] [max_rounds]
     // Example: tacos DGX2_2 allgather 12MB multi 100
-    std::string topologyName = "switch_clique";  // default topology
-    std::string collectiveName = "allgather";  // default collective
+    std::string topologyName = "mesh2d";  // default topology
+    std::string collectiveName = "alltoall";  // default collective
     bool enableMultiRound = false;
     int maxNoImprovementRounds = 10;  // default max rounds without improvement
-    int64_t dataSizeBytes = 1 * (1 << 20);  // default: 1 MiB
+    int64_t dataSizeBytes = 1024 * (1 << 20);  // default: 1024 MiB
     
     if (argc > 1) {
         topologyName = argv[1];
@@ -251,7 +251,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Average synthesis time: " << result.totalSynthesisTime / 1000 / result.totalRounds << " ms" << std::endl;
         std::cout << "Best collective time: " << result.bestCollectiveTime 
                   << " us (found at round " << result.bestRound << ")" << std::endl;
-    std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2)
+        std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2)
           << algoBandwidth << " GiB/s" << std::endl;
         std::cout << "Average link utilization: " << std::fixed << std::setprecision(2) 
                   << linkUtilization << "%" << std::endl;
@@ -282,7 +282,7 @@ int main(int argc, char* argv[]) {
         std::cout << std::endl;
         std::cout << "Time to solve: " << time / 1000 << " ms" << std::endl;
         std::cout << "Collective Time: " << collectiveTime << " us" << std::endl;
-    std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2)
+        std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2)
           << algoBandwidth << " GiB/s" << std::endl;
         std::cout << "Average link utilization: " << std::fixed << std::setprecision(2) 
                   << linkUtilization << "%" << std::endl;
