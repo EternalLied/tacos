@@ -10,6 +10,8 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <memory>
 #include <limits>
 #include <random>
+#include <queue>
+#include <algorithm>
 #include <tacos/synthesizer/time_expanded_network.h>
 
 using namespace tacos;
@@ -49,6 +51,10 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     // per-edge Δ & GPU->GPU最短路
     computeEdgeTimes_(chunkSize);
     computeRoutes_(chunkSize);
+    
+    // AllToAll optimization: compute distance table and direct neighbors
+    computeDistanceTable_(chunkSize);
+    computeDirectNeighbors_();
 
     // Initialize round-used edges tracker
     roundUsedEdges_.assign(totalNodes_, std::vector<char>(totalNodes_, 0));
@@ -577,11 +583,12 @@ bool TimeExpandedNetwork::canReserveRoute_(const Route& r, const Time t0) const 
             // Edge is busy - route cannot be reserved
             return false;
         }
-        // Check if edge was already used in current matching round
-        // (prevents path conflicts within same timestep even at different times)
-        if (roundUsedEdges_[u][v]) {
-            return false;
-        }
+        // OPTIMIZATION: Removed roundUsedEdges check to allow edge reuse at different times
+        // The edgeBusyUntil check above already prevents actual time conflicts
+        // Removing this constraint increases parallelism significantly
+        // if (roundUsedEdges_[u][v]) {
+        //     return false;
+        // }
         // switch caps at u/v if they are switches
         const int sid_u = topology_.switchIdFromNode(u);
         const int sid_v = topology_.switchIdFromNode(v);
@@ -606,8 +613,8 @@ void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept 
         edgeBusyUntil_[u][v] = t + d;
         // Accumulate busy time for this physical edge
         edgeAccumulatedBusyTime_[u][v] += d;
-        // mark edge as used in this matching round
-        roundUsedEdges_[u][v] = 1;
+        // OPTIMIZATION: No longer marking roundUsedEdges since we removed the constraint
+        // roundUsedEdges_[u][v] = 1;
         // switch caps
         const int sid_u = topology_.switchIdFromNode(u);
         const int sid_v = topology_.switchIdFromNode(v);
@@ -615,4 +622,186 @@ void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept 
         if (sid_v >= 0) swReserve_(sid_v, t, t + d, /*isIn=*/true);
         t += d;
     }
+}
+
+// ============================================================================
+// AllToAll Optimization: Dynamic Greedy Routing Implementation
+// ============================================================================
+
+void TimeExpandedNetwork::computeDistanceTable_(const ChunkSize chunkSize) noexcept {
+    // Initialize distance tables
+    distanceTable_.assign(npusCount_, std::vector<std::pair<NpuID, Time>>());
+    distanceMatrix_.assign(npusCount_, std::vector<Time>(npusCount_, std::numeric_limits<Time>::max()));
+    directLinkTimes_.assign(npusCount_, std::vector<Time>(npusCount_, -1));
+    
+    // For each target NPU, run Dijkstra to get distances from all other NPUs
+    for (int target = 0; target < npusCount_; ++target) {
+        std::vector<Time> dist(totalNodes_, std::numeric_limits<Time>::max() / 4);
+        using QN = std::pair<Time, int>;
+        std::priority_queue<QN, std::vector<QN>, std::greater<QN>> pq;
+        
+        dist[target] = 0;
+        pq.push({0, target});
+        
+        while (!pq.empty()) {
+            auto [d_u, u] = pq.top();
+            pq.pop();
+            if (d_u > dist[u]) continue;
+            
+            for (int v = 0; v < totalNodes_; ++v) {
+                if (hasEdge_[u][v]) {
+                    Time newDist = d_u + edgeDelta_[u][v];
+                    if (newDist < dist[v]) {
+                        dist[v] = newDist;
+                        pq.push({newDist, v});
+                    }
+                }
+            }
+        }
+        
+        // Store distances from all NPUs to this target, sorted
+        for (int src = 0; src < npusCount_; ++src) {
+            if (src != target && dist[src] < std::numeric_limits<Time>::max() / 4) {
+                distanceTable_[target].push_back({src, dist[src]});
+                // Also populate fast lookup matrix for O(1) access
+                distanceMatrix_[src][target] = dist[src];
+            }
+        }
+        
+        // Sort by distance (ascending)
+        std::sort(distanceTable_[target].begin(), distanceTable_[target].end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+    }
+    
+    // Store direct link times between NPUs
+    for (int u = 0; u < npusCount_; ++u) {
+        for (int v = 0; v < npusCount_; ++v) {
+            if (u != v && hasEdge_[u][v]) {
+                directLinkTimes_[u][v] = edgeDelta_[u][v];
+            }
+        }
+    }
+}
+
+void TimeExpandedNetwork::computeDirectNeighbors_() noexcept {
+    // Initialize
+    directDeviceNeighbors_.assign(npusCount_, std::unordered_set<NpuID>());
+    
+    // For each NPU, find direct device neighbors
+    // Direct neighbor = connected by a path that doesn't cross another device
+    for (int u = 0; u < npusCount_; ++u) {
+        for (int v = 0; v < npusCount_; ++v) {
+            if (u == v) continue;
+            
+            // Check if there's a path from u to v without crossing another device
+            bool isDirectNeighbor = false;
+            
+            // Case 1: Direct device-to-device edge
+            if (hasEdge_[u][v]) {
+                isDirectNeighbor = true;
+            }
+            // Case 2: Path through switches only (no intermediate devices)
+            else {
+                // BFS to check if we can reach v from u without crossing devices
+                std::queue<int> q;
+                std::vector<bool> visited(totalNodes_, false);
+                q.push(u);
+                visited[u] = true;
+                
+                while (!q.empty() && !isDirectNeighbor) {
+                    int curr = q.front();
+                    q.pop();
+                    
+                    for (int next = 0; next < totalNodes_; ++next) {
+                        if (!hasEdge_[curr][next] || visited[next]) continue;
+                        
+                        if (next == v) {
+                            // Reached target
+                            isDirectNeighbor = true;
+                            break;
+                        }
+                        
+                        // Only continue through switches
+                        if (next >= npusCount_) {  // next is a switch
+                            visited[next] = true;
+                            q.push(next);
+                        }
+                    }
+                }
+            }
+            
+            if (isDirectNeighbor) {
+                directDeviceNeighbors_[u].insert(v);
+            }
+        }
+    }
+}
+
+int TimeExpandedNetwork::findNextHopGreedy(const NpuID src, const NpuID dest) const noexcept {
+    if (src < 0 || src >= npusCount_ || dest < 0 || dest >= npusCount_) {
+        return -1;
+    }
+    
+    if (src == dest) {
+        return dest;  // Already at destination - return dest to indicate success
+    }
+    
+    // Check if dest is a direct neighbor - if so, return it directly
+    if (directDeviceNeighbors_[src].count(dest) > 0) {
+        return dest;  // Can go directly to destination
+    }
+    
+    // Get current distance from src to dest
+    Time currentDist = getDistance(src, dest);
+    if (currentDist >= std::numeric_limits<Time>::max() / 4) {
+        return -1;  // Unreachable
+    }
+    
+    // Collect best neighbors (strictly closer) and pick one at random
+    int bestNeighbor = -1;
+    Time bestDist = currentDist;  // Must be strictly better
+    std::vector<int> bestNeighbors;
+    
+    const auto& neighbors = directDeviceNeighbors_[src];
+    for (const auto neighbor : neighbors) {
+        Time neighborDist = getDistance(neighbor, dest);
+        if (neighborDist >= currentDist) {
+            continue;  // Not making progress
+        }
+
+        if (neighborDist < bestDist) {
+            bestDist = neighborDist;
+            bestNeighbors.clear();
+            bestNeighbors.push_back(neighbor);
+        } else if (neighborDist == bestDist) {
+            bestNeighbors.push_back(neighbor);
+        }
+    }
+
+    if (!bestNeighbors.empty()) {
+        // Simple random choice among equally good neighbors
+        std::mt19937 rng(static_cast<unsigned>(std::random_device{}()));
+        std::uniform_int_distribution<size_t> dist(0, bestNeighbors.size() - 1);
+        bestNeighbor = bestNeighbors[dist(rng)];
+    }
+
+    return bestNeighbor;
+}
+
+TimeExpandedNetwork::Time TimeExpandedNetwork::getDistance(const NpuID src, const NpuID dest) const noexcept {
+    if (src < 0 || src >= npusCount_ || dest < 0 || dest >= npusCount_) {
+        return std::numeric_limits<Time>::max();
+    }
+    
+    if (src == dest) {
+        return 0;
+    }
+    
+    // O(1) lookup in fast matrix (instead of O(N) linear scan)
+    if (src < static_cast<int>(distanceMatrix_.size()) && 
+        dest < static_cast<int>(distanceMatrix_[src].size())) {
+        return distanceMatrix_[src][dest];
+    }
+    
+    return std::numeric_limits<Time>::max();  // Unreachable
 }

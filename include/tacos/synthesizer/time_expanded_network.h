@@ -124,6 +124,19 @@ class TimeExpandedNetwork {
     /// @return node index of first intermediate device, or -1 if no intermediate device
     [[nodiscard]] int getFirstIntermediateDevice(NpuID src, NpuID dest) const noexcept;
 
+    /// @brief Find best available next hop for AllToAll greedy routing
+    /// @details Selects neighbor that is closer to dest and has available link
+    /// @param src current source NPU ID
+    /// @param dest final destination NPU ID
+    /// @return next hop NPU ID, or -1 if no progress can be made
+    [[nodiscard]] int findNextHopGreedy(NpuID src, NpuID dest) const noexcept;
+
+    /// @brief Get distance from src to dest (precomputed transfer time)
+    /// @param src source NPU ID
+    /// @param dest destination NPU ID
+    /// @return transfer time, or max if unreachable
+    [[nodiscard]] Time getDistance(NpuID src, NpuID dest) const noexcept;
+
     /// @brief Transfer chunk using partial route (only to first intermediate device)
     /// @details For AllToAll multi-hop optimization: reserve only src->intermediate segment
     /// @param src source NPU ID
@@ -206,9 +219,23 @@ class TimeExpandedNetwork {
     // within the same timestep (even if used at different times)
     std::vector<std::vector<char>> roundUsedEdges_; // [u][v] = 1 if edge used this round
 
+    // === AllToAll Optimization: Dynamic Greedy Routing ===
+    // Distance table: for each target NPU, stores (npu, distance) sorted by distance
+    std::vector<std::vector<std::pair<NpuID, Time>>> distanceTable_;
+    // Fast lookup matrix: distanceMatrix_[src][dest] = distance from src to dest (O(1) lookup)
+    std::vector<std::vector<Time>> distanceMatrix_;
+    
+    // Direct device neighbors: NPUs that are directly connected without crossing another device
+    std::vector<std::unordered_set<NpuID>> directDeviceNeighbors_;
+    
+    // Direct link transfer times between device neighbors
+    std::vector<std::vector<Time>> directLinkTimes_;  // [src][dst] = transfer time
+
     // helpers
     void computeEdgeTimes_(ChunkSize chunkSize) noexcept;
     void computeRoutes_(ChunkSize chunkSize) noexcept;
+    void computeDistanceTable_(ChunkSize chunkSize) noexcept;
+    void computeDirectNeighbors_() noexcept;
     [[nodiscard]] bool canReserveRoute_(const Route& r, Time t0) const noexcept;
     void reserveRoute_(const Route& r, Time t0) noexcept;
     [[nodiscard]] bool swCapOkAt_(int sid, Time s, Time e, bool isIn) const noexcept;

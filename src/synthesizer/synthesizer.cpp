@@ -15,7 +15,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <chrono>
 #include <tacos/synthesizer/synthesizer.h>
 #include <tacos/event_queue/timer.h>
-#include "log.h"
+#include <tacos/log.h>
 
 using namespace tacos;
 
@@ -229,6 +229,22 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
         std::cout << "  linkChunkMatching:       " << std::setw(8)
                   << totalMatchingTime / 1000.0 << " ms  (" << std::setw(5)
                   << (totalMatchingTime / totalSolveTime * 100) << "%)" << std::endl;
+        
+        // Report priority adjustment statistics
+        if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
+            if (priorityAdjustmentCount_ > 0) {
+                const double avgAdjustTime = priorityAdjustmentTime_ / priorityAdjustmentCount_;
+                const double totalMs = priorityAdjustmentTime_ / 1000.0;
+                const double percentage = (priorityAdjustmentTime_ / totalSolveTime) * 100.0;
+                
+                std::cout << "  Priority adjustment:     " << std::setw(8)
+                          << totalMs << " ms  (" << std::setw(5)
+                          << percentage << "%)" << std::endl;
+                std::cout << "    -> " << priorityAdjustmentCount_ << " calls, avg "
+                          << std::fixed << std::setprecision(2) << avgAdjustTime << " us per call" << std::endl;
+            }
+        }
+        
         std::cout << "=================================================" << std::endl;
         std::cout << std::endl;
     );
@@ -236,6 +252,7 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
     // all matching has been finished
     // return measured collective_ time
     assert(collectiveTime_ > 0);
+    
     return collectiveTime_;
 }
 
@@ -250,6 +267,12 @@ void Synthesizer::initialize_(const Topology& topology,
     topology_ = &topology;
     collective_ = &collective;
     collectiveType_ = collective.getType();
+    
+#ifdef ENABLE_PERF_STATS
+    // reset performance statistics
+    priorityAdjustmentTime_ = 0.0;
+    priorityAdjustmentCount_ = 0;
+#endif
 
     // set variables
     npusCount = topology_->npusCount();
@@ -282,11 +305,11 @@ void Synthesizer::initializeSortedPostconditions_() noexcept {
         }
     }
     
-    // Sort by physical hop count (same logic as shufflePostcondition_)
+    // Sort by transfer time (using distanceMatrix_ from TEN)
     std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
     
-    auto computeMinPhysicalHops = [this, &backtrackCache](ChunkID chunk, NpuID dest) -> int {
-        int minHops = std::numeric_limits<int>::max();
+    auto computeMinTransferTime = [this, &backtrackCache](ChunkID chunk, NpuID dest) -> Time {
+        Time minTime = std::numeric_limits<Time>::max();
         auto it = backtrackCache.find(dest);
         if (it == backtrackCache.end()) {
             it = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
@@ -294,40 +317,41 @@ void Synthesizer::initializeSortedPostconditions_() noexcept {
         const auto& sources = it->second;
         for (const auto src : sources) {
             if (chunkMap_[chunk][src]) {
-                int hops = ten_->getRoutePhysicalHops(src, dest);
-                minHops = std::min(minHops, hops);
+                Time transferTime = ten_->getDistance(src, dest);
+                minTime = std::min(minTime, transferTime);
             }
         }
-        return minHops;
+        return minTime;
     };
     
-    // Flatten and compute hop counts
-    std::vector<std::pair<Condition, int>> conditionsWithHops;
-    conditionsWithHops.reserve(postconditionMap.size() * 8);
+    // Flatten and compute transfer times
+    std::vector<std::pair<Condition, Time>> conditionsWithTimes;
+    conditionsWithTimes.reserve(postconditionMap.size() * 8);
     for (const auto& [dest, chunks] : postconditionMap) {
         for (const auto chunk : chunks) {
-            int minPhysicalHops = computeMinPhysicalHops(chunk, dest);
-            conditionsWithHops.emplace_back(Condition{chunk, dest}, minPhysicalHops);
+            Time minTransferTime = computeMinTransferTime(chunk, dest);
+            conditionsWithTimes.emplace_back(Condition{chunk, dest}, minTransferTime);
         }
     }
     
-    // Sort by physical hop count
+    // Sort by transfer time
     // Strategy depends on collective type:
-    // - AllGather: Ascending (short paths first) - no intermediate caching needed
-    // - AllToAll: Descending (long paths first) - benefits from progressive intermediate caching
+    // - AllGather: Ascending (short transfers first) - no intermediate caching needed
+    // - AllToAll: Descending (long transfers first) - benefits from progressive intermediate caching
     const bool useDescendingOrder = (collectiveType_ == CollectiveType::ALL_TO_ALL);
     
-    std::stable_sort(conditionsWithHops.begin(), conditionsWithHops.end(),
+    std::stable_sort(conditionsWithTimes.begin(), conditionsWithTimes.end(),
         [useDescendingOrder](const auto& a, const auto& b) {
             return useDescendingOrder ? (a.second > b.second) : (a.second < b.second);
         });
     
-    // Shuffle within same-hop groups
-    for (auto it = conditionsWithHops.begin(); it != conditionsWithHops.end(); ) {
-        int currentHops = it->second;
-        auto groupEnd = std::find_if(it, conditionsWithHops.end(),
-            [currentHops](const auto& elem) { 
-                return elem.second != currentHops; 
+    // Shuffle within same-time groups (±epsilon tolerance)
+    constexpr Time epsilon = 1e-6;
+    for (auto it = conditionsWithTimes.begin(); it != conditionsWithTimes.end(); ) {
+        Time currentTime = it->second;
+        auto groupEnd = std::find_if(it, conditionsWithTimes.end(),
+            [currentTime, epsilon](const auto& elem) {
+                return std::abs(elem.second - currentTime) > epsilon;
             });
         std::shuffle(it, groupEnd, randomEngine);
         it = groupEnd;
@@ -335,8 +359,8 @@ void Synthesizer::initializeSortedPostconditions_() noexcept {
     
     // Extract sorted conditions
     sortedPostconditions_.clear();
-    sortedPostconditions_.reserve(conditionsWithHops.size());
-    for (const auto& [cond, _] : conditionsWithHops) {
+    sortedPostconditions_.reserve(conditionsWithTimes.size());
+    for (const auto& [cond, _] : conditionsWithTimes) {
         sortedPostconditions_.push_back(cond);
     }
 }
@@ -350,6 +374,121 @@ void Synthesizer::pruneSatisfiedPostconditions_() noexcept {
             }),
         sortedPostconditions_.end()
     );
+}
+
+void Synthesizer::adjustPostconditionPriority_(const ChunkID chunk, const NpuID dest) noexcept {
+#ifdef ENABLE_PERF_STATS
+    // Performance measurement: start timer
+    auto startTime = std::chrono::high_resolution_clock::now();
+#endif
+    
+    // Find the condition in sortedPostconditions_
+    const Condition targetCond{chunk, dest};
+    auto it = std::find(sortedPostconditions_.begin(), sortedPostconditions_.end(), targetCond);
+    
+    if (it == sortedPostconditions_.end()) {
+        return;  // condition already satisfied or not found
+    }
+    
+    const size_t oldIndex = std::distance(sortedPostconditions_.begin(), it);
+    
+    // Compute new priority (minimum remaining distance from any source that has the chunk)
+    std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
+    auto backtrackIt = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
+    const auto& sources = backtrackIt->second;
+    
+    Time newDistance = std::numeric_limits<Time>::max();
+    for (const auto src : sources) {
+        if (chunkMap_[chunk][src]) {
+            Time distance = ten_->getDistance(src, dest);
+            newDistance = std::min(newDistance, distance);
+        }
+    }
+    
+    if (newDistance == std::numeric_limits<Time>::max()) {
+        return;  // no valid source found
+    }
+    
+    // Lambda to compute distance for a given condition
+    auto computeDistance = [this, &backtrackCache](const Condition& cond) -> Time {
+        auto it = backtrackCache.find(cond.second);
+        if (it == backtrackCache.end()) {
+            it = backtrackCache.emplace(cond.second, ten_->backtrack(cond.second)).first;
+        }
+        Time minDist = std::numeric_limits<Time>::max();
+        for (const auto src : it->second) {
+            if (chunkMap_[cond.first][src]) {
+                minDist = std::min(minDist, ten_->getDistance(src, cond.second));
+            }
+        }
+        return minDist;
+    };
+    
+    // Determine sort order based on collective type
+    const bool useDescendingOrder = (collectiveType_ == CollectiveType::ALL_TO_ALL);
+    
+    size_t newIndex = oldIndex;
+    
+    // Linear scan to find correct new position (tested to be faster than binary search)
+    // For descending order: distance decreased – scan backward to find insertion point
+    // For ascending order: distance decreased – scan forward to find insertion point
+    // When distances are equal, use 50% probability to continue scanning for randomness
+    
+    std::uniform_int_distribution<int> coinFlip(0, 1);
+    
+    if (useDescendingOrder) {
+        // Descending: larger distance = higher priority (earlier position)
+        // Since we scheduled one hop, distance decreased – need to move backward
+        // Scan backward from current position to find first element with distance < newDistance
+        while (newIndex < sortedPostconditions_.size() - 1) {
+            const auto& nextCond = sortedPostconditions_[newIndex + 1];
+            Time nextDistance = computeDistance(nextCond);
+            
+            if (newDistance < nextDistance) {
+                ++newIndex;  // move backward (lower priority)
+            } else if (newDistance == nextDistance && coinFlip(randomEngine) == 1) {
+                ++newIndex;  // 50% chance to continue when equal
+            } else {
+                break;  // found correct position
+            }
+        }
+    } else {
+        // Ascending: smaller distance = higher priority (earlier position)
+        // Since we scheduled one hop, distance decreased – need to move forward
+        // Scan forward from current position to find first element with distance > newDistance
+        while (newIndex > 0) {
+            const auto& prevCond = sortedPostconditions_[newIndex - 1];
+            Time prevDistance = computeDistance(prevCond);
+            
+            if (newDistance < prevDistance) {
+                --newIndex;  // move forward (higher priority)
+            } else if (newDistance == prevDistance && coinFlip(randomEngine) == 1) {
+                --newIndex;  // 50% chance to continue when equal
+            } else {
+                break;  // found correct position
+            }
+        }
+    }
+    
+    // Move the condition if position changed
+    if (newIndex != oldIndex) {
+        sortedPostconditions_.erase(it);
+        sortedPostconditions_.insert(sortedPostconditions_.begin() + newIndex, targetCond);
+        
+        DebugLog(
+            std::cout << "  [Priority Adjust] Chunk " << chunk << " -> GPU" << dest
+                      << ": position " << oldIndex << " -> " << newIndex
+                      << " (distance: " << newDistance << "μs)" << std::endl;
+        );
+    }
+    
+#ifdef ENABLE_PERF_STATS
+    // Performance measurement: end timer and accumulate
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+    priorityAdjustmentTime_ += duration.count();
+    priorityAdjustmentCount_++;
+#endif
 }
 
 Synthesizer::PostconditionMap Synthesizer::filterPostcondition_() const noexcept {
@@ -607,143 +746,148 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
     }
     const auto& sources = it->second;
 
-    // filter candidate link-chunk matching
-    // prioritize by: 1) minimum physical hop count, 2) earliest arrival time
-    // Use physical hops to avoid Cut-Through routes getting unfair priority
+    // Candidate selection: prefer fewer physical hops, then earlier arrival time
     auto minHopCount = std::numeric_limits<int>::max();
     auto arrivalTime = std::numeric_limits<Time>::max();
-    auto candidates = std::vector<NpuID>();
+    std::vector<NpuID> candidates;
 
-    // iterate over all source NPUs
     for (const auto src : sources) {
-        // if src does not have the chunk, skip
         if (!chunkMap_[chunk][src]) {
-            continue;
+            continue;  // source does not have the chunk
         }
 
-        // get physical hop count and transfer time for this route
         const auto hopCount = ten_->getRoutePhysicalHops(src, dest);
+        if (hopCount < 0) {
+            continue;  // invalid route
+        }
+
         const auto linkWeight = ten_->linkTransferTime(src, dest);
         const auto linkTime = currentTime_ + linkWeight;
 
-        // skip invalid routes
-        if (hopCount < 0) continue;
-
-        // Policy enforcement (per-route) - different strategies for different collectives
+        // Policy enforcement per-collective
         const bool hasSwitchInTopology = ten_->hasSwitches();
         const bool routeThroughSwitch = ten_->routeHasSwitch(src, dest);
         const bool hasMixedEdges = ten_->routeHasMixedEdges(src, dest);
-        
+
         if (collectiveType_ == CollectiveType::ALL_GATHER) {
-            // === AllGather: Strict routing policy (original) ===
-            // 1) If topology has no switches, only schedule 1-hop routes
             if (!hasSwitchInTopology && hopCount != 1) continue;
-
-            // 2) If the route's shortest path does not traverse any switch, require 1-hop
             if (!routeThroughSwitch && hopCount != 1) continue;
-
-            // 3) Do not match routes that mix direct device edges with switch edges
             if (hasMixedEdges) continue;
-            
-        } else if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
-            // === AllToAll: Relaxed routing policy ===
-            // Allow multi-hop routes and mixed edges for better connectivity
-            // This is necessary for topologies like mesh where not all NPU pairs are directly connected
-            // No restrictions on hop count or edge mixing
-            
-        } else {
-            // === Unknown collective: Use conservative AllGather policy ===
+        } else if (collectiveType_ != CollectiveType::ALL_TO_ALL) {
+            // Unknown collective: conservative policy
             if (!hasSwitchInTopology && hopCount != 1) continue;
             if (!routeThroughSwitch && hopCount != 1) continue;
             if (hasMixedEdges) continue;
         }
 
-        // Priority 1: Prefer routes with fewer hops (better link utilization)
         if (hopCount < minHopCount) {
             minHopCount = hopCount;
             arrivalTime = linkTime;
             candidates.clear();
-            candidates.emplace_back(src);
+            candidates.push_back(src);
         } else if (hopCount == minHopCount) {
-            // Priority 2: Among same hop count, prefer earliest arrival
             if (linkTime < arrivalTime) {
                 arrivalTime = linkTime;
                 candidates.clear();
-                candidates.emplace_back(src);
+                candidates.push_back(src);
             } else if (isEqual(linkTime, arrivalTime)) {
-                candidates.emplace_back(src);
+                candidates.push_back(src);
             }
         }
     }
 
-    // if candidates are empty, no match can be made
     if (candidates.empty()) {
         return -1;
     }
 
-    // randomly shuffle and select one source NPU to make link-chunk match
-    // (among candidates with same hop count and arrival time)
+    // Shuffle equal-priority candidates
     std::shuffle(candidates.begin(), candidates.end(), randomEngine);
-    
-    // Try candidates in shuffled order until we find one with an available physical route
-    // (routes may become unavailable between backtrack() call and actual reservation)
+
     for (const auto selectedSrc : candidates) {
-        // === AllToAll multi-hop optimization ===
-        // For AllToAll with multi-hop routes crossing intermediate devices,
-        // only reserve the segment to the first intermediate device to avoid
-        // occupying too many links in a single timestep
+        // === AllToAll Optimization 1: prioritize intermediate continuations ===
+        // DISABLED: Testing performance impact on larger topologies
+        /*
         if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
-            const int intermediateDevice = ten_->getFirstIntermediateDevice(selectedSrc, dest);
-            
-            if (intermediateDevice >= 0) {
-                // Multi-hop route with intermediate device found
-                // Check only the partial route (src -> intermediate) availability
-                if (!ten_->canReserveRoute(selectedSrc, intermediateDevice)) {
-                    continue;  // Partial route not available, try next candidate
+            const auto originalSrc = collective_->precondition(chunk);
+            const auto& postconditions = collective_->postcondition(chunk);
+
+            const bool isIntermediate = (selectedSrc != originalSrc) &&
+                (std::find(postconditions.begin(), postconditions.end(), selectedSrc) == postconditions.end());
+
+            if (isIntermediate && std::find(postconditions.begin(), postconditions.end(), dest) != postconditions.end()) {
+                if (ten_->canReserveRoute(selectedSrc, dest)) {
+                    const auto contArrival = currentTime_ + ten_->linkTransferTime(selectedSrc, dest);
+                    ten_->transferChunk(selectedSrc, dest, chunk, contArrival);
+                    eventQueue_.schedule(contArrival);
+
+                    DebugLog(
+                        std::cout << "  [AllToAll] Continuation: Chunk " << chunk
+                                  << " from intermediate GPU" << selectedSrc << " -> GPU" << dest << std::endl;
+                    );
+
+                    return selectedSrc;
                 }
-                
-                // Reserve only src -> intermediate segment
-                const auto intermediateArrivalTime = currentTime_ + ten_->linkTransferTime(selectedSrc, intermediateDevice);
-                
-                // DebugLog(
-                //     std::cout << "  [DEBUG] AllToAll partial: Chunk " << chunk 
-                //               << " GPU" << selectedSrc << " -> GPU" << intermediateDevice 
-                //               << " (intermediate, final dest: GPU" << dest << ")" << std::endl;
-                // );
-                
-                ten_->transferChunkPartial(selectedSrc, intermediateDevice, chunk, intermediateArrivalTime);
-                eventQueue_.schedule(intermediateArrivalTime);
-                
-                // Update chunkMap to reflect chunk now at intermediate device
-                // This allows the intermediate device to serve as a source for subsequent hops
-                chunkMap_[chunk][intermediateDevice] = true;
-                
-                return selectedSrc;
             }
         }
-        
+        */
+
+        // === AllToAll Optimization 2: greedy-only routing ===
+        if (collectiveType_ == CollectiveType::ALL_TO_ALL && selectedSrc != dest) {
+            const int greedyNextHop = ten_->findNextHopGreedy(selectedSrc, dest);
+
+            if (greedyNextHop < 0) {
+                continue;  // no progress possible
+            }
+
+            if (greedyNextHop == dest) {
+                const auto directArrival = currentTime_ + ten_->linkTransferTime(selectedSrc, dest);
+                if (!ten_->canReserveRoute(selectedSrc, dest)) {
+                    continue;
+                }
+                ten_->transferChunk(selectedSrc, dest, chunk, directArrival);
+                eventQueue_.schedule(directArrival);
+                // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
+                return selectedSrc;
+            }
+
+            if (!ten_->canReserveRoute(selectedSrc, greedyNextHop)) {
+                continue;
+            }
+            const auto greedyArrivalTime = currentTime_ + ten_->linkTransferTime(selectedSrc, greedyNextHop);
+            ten_->transferChunkPartial(selectedSrc, greedyNextHop, chunk, greedyArrivalTime);
+            eventQueue_.schedule(greedyArrivalTime);
+            // Do NOT mark chunkMap here - will be marked when chunk arrives at intermediate node in expandTenTimestep_
+
+            DebugLog(
+                std::cout << "  [AllToAll] Partial (greedy-only): Chunk " << chunk
+                          << " GPU" << selectedSrc << " -> GPU" << greedyNextHop
+                          << " (final dest: GPU" << dest << ")" << std::endl;
+            );
+
+            // Dynamically adjust priority since chunk state changed (moved to intermediate node)
+            adjustPostconditionPriority_(chunk, dest);
+
+            return selectedSrc;
+        }
+
         // === Standard full route check (AllGather or direct routes) ===
-        // Final check: verify physical route is still available
         if (!ten_->canReserveRoute(selectedSrc, dest)) {
-            continue;  // Route no longer available, try next candidate
+            continue;
+        }
+
+        ten_->transferChunk(selectedSrc, dest, chunk, arrivalTime);
+        eventQueue_.schedule(arrivalTime);
+        // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
+        
+        // Dynamically adjust priority for non-immediate transfers
+        if (collectiveType_ == CollectiveType::ALL_TO_ALL && selectedSrc != dest) {
+            adjustPostconditionPriority_(chunk, dest);
         }
         
-        // Route is available - reserve it
-        // DebugLog(
-        //     std::cout << "  [DEBUG] At time " << currentTime_ << ", reserving route for Chunk " << chunk 
-        //               << ": GPU" << selectedSrc << " -> GPU" << dest 
-        //               << " (arrival: " << arrivalTime << ")" << std::endl;
-        // );
-        ten_->transferChunk(selectedSrc, dest, chunk, arrivalTime);
-
-        // schedule an event when the matched chunk arrives
-        eventQueue_.schedule(arrivalTime);
-
         return selectedSrc;
     }
-    
-    // All candidates' routes became unavailable
-    return -1;
+
+    return -1;  // No candidate could reserve a route
 }
 
 bool Synthesizer::isEqual(const Time lhs, const Time rhs) noexcept {

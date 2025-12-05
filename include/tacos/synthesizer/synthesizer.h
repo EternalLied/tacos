@@ -18,6 +18,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <tacos/collective/collective.h>
 #include <tacos/event_queue/event_queue.h>
 #include <tacos/synthesizer/time_expanded_network.h>
+#include <tacos/log.h>
 #include <tacos/topology/topology.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -116,6 +117,14 @@ class Synthesizer {
     
     /// @brief Random number generator engine
     std::mt19937 randomEngine{std::random_device{}()};
+    
+#ifdef ENABLE_PERF_STATS
+    /// @brief Performance statistics: time spent in priority adjustment (microseconds)
+    mutable double priorityAdjustmentTime_ = 0.0;
+    
+    /// @brief Performance statistics: number of priority adjustments performed
+    mutable int priorityAdjustmentCount_ = 0;
+#endif
 
     /// @brief Initialize the synthesizer with the given topology and collective.
     /// @param topology target network topology
@@ -133,6 +142,11 @@ class Synthesizer {
     
     /// @brief Remove satisfied conditions from sortedPostconditions_ (in-place)
     void pruneSatisfiedPostconditions_() noexcept;
+
+    /// @brief Dynamically adjust priority of a single postcondition based on updated distance
+    /// @param chunk chunk ID that had a state update
+    /// @param dest destination NPU ID
+    void adjustPostconditionPriority_(ChunkID chunk, NpuID dest) noexcept;
 
     /// @brief Filter out chunks that have not yet arrived at their destination NPUs.
     /// @return map of destination NPUs -> set of chunks that have not yet arrived
