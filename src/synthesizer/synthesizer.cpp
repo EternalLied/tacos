@@ -746,9 +746,9 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
     }
     const auto& sources = it->second;
 
-    // Candidate selection: prefer fewer physical hops, then earlier arrival time
+    // Candidate selection: prefer earlier lower distance (1st priority), then fewer physical hops (2nd priority)
+    auto minDistance = std::numeric_limits<Time>::max();
     auto minHopCount = std::numeric_limits<int>::max();
-    auto arrivalTime = std::numeric_limits<Time>::max();
     std::vector<NpuID> candidates;
 
     for (const auto src : sources) {
@@ -761,8 +761,9 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
             continue;  // invalid route
         }
 
-        const auto linkWeight = ten_->linkTransferTime(src, dest);
-        const auto linkTime = currentTime_ + linkWeight;
+        // const auto linkWeight = ten_->getDistance(src, dest);
+        // const auto linkTime = currentTime_ + linkWeight;
+        const auto distance = ten_->getDistance(src, dest);
 
         // Policy enforcement per-collective
         const bool hasSwitchInTopology = ten_->hasSwitches();
@@ -780,17 +781,23 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
             if (hasMixedEdges) continue;
         }
 
-        if (hopCount < minHopCount) {
+        // Priority 1: Earlier distance (lower distance is better)
+        // Priority 2: Fewer physical hops (lower hopCount is better)
+        if (distance < minDistance) {
+            // Found a source with lower distance - clear and start new candidate list
+            minDistance = distance;
             minHopCount = hopCount;
-            arrivalTime = linkTime;
             candidates.clear();
             candidates.push_back(src);
-        } else if (hopCount == minHopCount) {
-            if (linkTime < arrivalTime) {
-                arrivalTime = linkTime;
+        } else if (isEqual(distance, minDistance)) {
+            // Same lower distance - use hop count as tie-breaker
+            if (hopCount < minHopCount) {
+                // Fewer hops with same lower distance - clear and start new candidate list
+                minHopCount = hopCount;
                 candidates.clear();
                 candidates.push_back(src);
-            } else if (isEqual(linkTime, arrivalTime)) {
+            } else if (hopCount == minHopCount) {
+                // Same lower distance and same hop count - add to candidates
                 candidates.push_back(src);
             }
         }
@@ -803,88 +810,21 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
     // Shuffle equal-priority candidates
     std::shuffle(candidates.begin(), candidates.end(), randomEngine);
 
+    // Try each candidate source in shuffled order
     for (const auto selectedSrc : candidates) {
-        // === AllToAll Optimization 1: prioritize intermediate continuations ===
-        // DISABLED: Testing performance impact on larger topologies
-        /*
-        if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
-            const auto originalSrc = collective_->precondition(chunk);
-            const auto& postconditions = collective_->postcondition(chunk);
-
-            const bool isIntermediate = (selectedSrc != originalSrc) &&
-                (std::find(postconditions.begin(), postconditions.end(), selectedSrc) == postconditions.end());
-
-            if (isIntermediate && std::find(postconditions.begin(), postconditions.end(), dest) != postconditions.end()) {
-                if (ten_->canReserveRoute(selectedSrc, dest)) {
-                    const auto contArrival = currentTime_ + ten_->linkTransferTime(selectedSrc, dest);
-                    ten_->transferChunk(selectedSrc, dest, chunk, contArrival);
-                    eventQueue_.schedule(contArrival);
-
-                    DebugLog(
-                        std::cout << "  [AllToAll] Continuation: Chunk " << chunk
-                                  << " from intermediate GPU" << selectedSrc << " -> GPU" << dest << std::endl;
-                    );
-
-                    return selectedSrc;
-                }
-            }
+        bool success = false;
+        
+        if (collectiveType_ == CollectiveType::ALL_GATHER) {
+            // AllGather: use direct precomputed routes (without passing through intermediate devices)
+            success = tryAllGatherRouting_(chunk, selectedSrc, dest);
+        } else if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
+            // AllToAll: use greedy routing (multi-hop with intermediate nodes)
+            success = tryAllToAllRouting_(chunk, selectedSrc, dest);
         }
-        */
 
-        // === AllToAll Optimization 2: greedy-only routing ===
-        if (collectiveType_ == CollectiveType::ALL_TO_ALL && selectedSrc != dest) {
-            const int greedyNextHop = ten_->findNextHopGreedy(selectedSrc, dest);
-
-            if (greedyNextHop < 0) {
-                continue;  // no progress possible
-            }
-
-            if (greedyNextHop == dest) {
-                const auto directArrival = currentTime_ + ten_->linkTransferTime(selectedSrc, dest);
-                if (!ten_->canReserveRoute(selectedSrc, dest)) {
-                    continue;
-                }
-                ten_->transferChunk(selectedSrc, dest, chunk, directArrival);
-                eventQueue_.schedule(directArrival);
-                // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
-                return selectedSrc;
-            }
-
-            if (!ten_->canReserveRoute(selectedSrc, greedyNextHop)) {
-                continue;
-            }
-            const auto greedyArrivalTime = currentTime_ + ten_->linkTransferTime(selectedSrc, greedyNextHop);
-            ten_->transferChunkPartial(selectedSrc, greedyNextHop, chunk, greedyArrivalTime);
-            eventQueue_.schedule(greedyArrivalTime);
-            // Do NOT mark chunkMap here - will be marked when chunk arrives at intermediate node in expandTenTimestep_
-
-            DebugLog(
-                std::cout << "  [AllToAll] Partial (greedy-only): Chunk " << chunk
-                          << " GPU" << selectedSrc << " -> GPU" << greedyNextHop
-                          << " (final dest: GPU" << dest << ")" << std::endl;
-            );
-
-            // Dynamically adjust priority since chunk state changed (moved to intermediate node)
-            adjustPostconditionPriority_(chunk, dest);
-
+        if (success) {
             return selectedSrc;
         }
-
-        // === Standard full route check (AllGather or direct routes) ===
-        if (!ten_->canReserveRoute(selectedSrc, dest)) {
-            continue;
-        }
-
-        ten_->transferChunk(selectedSrc, dest, chunk, arrivalTime);
-        eventQueue_.schedule(arrivalTime);
-        // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
-        
-        // Dynamically adjust priority for non-immediate transfers
-        if (collectiveType_ == CollectiveType::ALL_TO_ALL && selectedSrc != dest) {
-            adjustPostconditionPriority_(chunk, dest);
-        }
-        
-        return selectedSrc;
     }
 
     return -1;  // No candidate could reserve a route
@@ -893,6 +833,56 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
 bool Synthesizer::isEqual(const Time lhs, const Time rhs) noexcept {
     constexpr Time epsilon = 1e-9;
     return std::abs(lhs - rhs) < epsilon;
+}
+
+bool Synthesizer::tryAllToAllRouting_(const ChunkID chunk, const NpuID selectedSrc, const NpuID dest) noexcept {
+    // Find best available next hop using greedy algorithm with route availability check
+    const int greedyNextHop = ten_->findNextHopGreedy(selectedSrc, dest, currentTime_);
+    
+    if (greedyNextHop < 0) {
+        return false;  // No progress possible or all routes busy
+    }
+    
+    // Case 1: Direct hop to destination
+    if (greedyNextHop == dest) {
+        const auto directArrival = currentTime_ + ten_->getDistance(selectedSrc, dest);
+        ten_->transferChunk(selectedSrc, dest, chunk, directArrival);
+        eventQueue_.schedule(directArrival);
+        // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
+        return true;
+    }
+    
+    // Case 2: Intermediate hop (greedy routing)
+    const auto greedyArrivalTime = currentTime_ + ten_->getDistance(selectedSrc, greedyNextHop);
+    ten_->transferChunkPartial(selectedSrc, greedyNextHop, chunk, greedyArrivalTime);
+    eventQueue_.schedule(greedyArrivalTime);
+    // Do NOT mark chunkMap here - will be marked when chunk arrives at intermediate node in expandTenTimestep_
+    
+    DebugLog(
+        std::cout << "  [AllToAll] Partial (greedy-only): Chunk " << chunk
+                  << " GPU" << selectedSrc << " -> GPU" << greedyNextHop
+                  << " (final dest: GPU" << dest << ")" << std::endl;
+    );
+    
+    // Dynamically adjust priority since chunk state changed (moved to intermediate node)
+    adjustPostconditionPriority_(chunk, dest);
+    
+    return true;
+}
+
+bool Synthesizer::tryAllGatherRouting_(const ChunkID chunk, const NpuID selectedSrc, const NpuID dest) noexcept {
+    // Check if precomputed route is available
+    if (!ten_->canReserveRoute(selectedSrc, dest)) {
+        return false;  // Route not available
+    }
+    
+    // Reserve and schedule the direct transfer
+    const auto transferArrivalTime = currentTime_ + ten_->getDistance(selectedSrc, dest);
+    ten_->transferChunk(selectedSrc, dest, chunk, transferArrivalTime);
+    eventQueue_.schedule(transferArrivalTime);
+    // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
+    
+    return true;
 }
 
 double Synthesizer::calculateLinkUtilization(const Topology& topology) const noexcept {

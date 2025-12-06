@@ -197,5 +197,19 @@ class Synthesizer {
     /// @param rhs Time value
     /// @return true if lhs and rhs are equal (epsilon 1e-9), false otherwise
     [[nodiscard]] static bool isEqual(Time lhs, Time rhs) noexcept;
+    
+    /// @brief Try AllToAll greedy routing for a candidate source
+    /// @param chunk chunk ID to transfer
+    /// @param selectedSrc candidate source NPU
+    /// @param dest final destination NPU
+    /// @return true if routing succeeded, false otherwise
+    bool tryAllToAllRouting_(ChunkID chunk, NpuID selectedSrc, NpuID dest) noexcept;
+    
+    /// @brief Try AllGather direct routing (precomputed routes)
+    /// @param chunk chunk ID to transfer
+    /// @param selectedSrc candidate source NPU
+    /// @param dest destination NPU
+    /// @return true if routing succeeded, false otherwise
+    bool tryAllGatherRouting_(ChunkID chunk, NpuID selectedSrc, NpuID dest) noexcept;
 };
 }  // namespace tacos

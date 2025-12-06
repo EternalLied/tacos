@@ -40,11 +40,6 @@ class TimeExpandedNetwork {
     [[nodiscard]] bool available(NpuID src, NpuID dest) const noexcept;
 
     /// @brief Retrieve the chunk transfer time between two NPUs
-    /// @param src source NPU ID
-    /// @param dest destination NPU ID
-    /// @return chunk transfer time in microseconds (us)
-    [[nodiscard]] Time linkTransferTime(NpuID src, NpuID dest) const noexcept;
-
     /// @brief Get the number of hops in the route from src to dest
     /// @param src source NPU ID
     /// @param dest destination NPU ID
@@ -125,11 +120,13 @@ class TimeExpandedNetwork {
     [[nodiscard]] int getFirstIntermediateDevice(NpuID src, NpuID dest) const noexcept;
 
     /// @brief Find best available next hop for AllToAll greedy routing
-    /// @details Selects neighbor that is closer to dest and has available link
+    /// @details Selects neighbor that is closer to dest and has available link.
+    ///          Checks route availability and falls back to suboptimal routes if needed.
     /// @param src current source NPU ID
     /// @param dest final destination NPU ID
+    /// @param currentTime current timestep for route availability check
     /// @return next hop NPU ID, or -1 if no progress can be made
-    [[nodiscard]] int findNextHopGreedy(NpuID src, NpuID dest) const noexcept;
+    [[nodiscard]] int findNextHopGreedy(NpuID src, NpuID dest, Time currentTime) const noexcept;
 
     /// @brief Get distance from src to dest (precomputed transfer time)
     /// @param src source NPU ID
@@ -184,9 +181,6 @@ class TimeExpandedNetwork {
     /// @details if the link is free, the value is negative.
     std::vector<std::vector<ChunkID>> chunk_;
 
-    /// @brief link transfer time of a chunk using alpha-beta model (in microseconds)
-    std::vector<std::vector<Time>> linkTransferTimes_ = {};
-
     // ===== Multi-switch physical resources =====
     struct EdgeKey { int u; int v; };
     // busy-until on physical directed edges (device/switch graph)
@@ -209,7 +203,6 @@ class TimeExpandedNetwork {
     struct Route {
       std::vector<int> nodes;     // node indices u->...->v
       std::vector<Time> deltas;   // per-edge Δ
-      Time total = 0;
       int logicalHops = 0;        // logical hop count (Cut-Through switches reduce hops)
       int physicalHops = 0;       // physical hop count (actual edges = nodes.size() - 1)
     };
@@ -220,30 +213,19 @@ class TimeExpandedNetwork {
     std::vector<std::vector<char>> roundUsedEdges_; // [u][v] = 1 if edge used this round
 
     // === AllToAll Optimization: Dynamic Greedy Routing ===
-    // Distance table: for each target NPU, stores (npu, distance) sorted by distance
-    std::vector<std::vector<std::pair<NpuID, Time>>> distanceTable_;
     // Fast lookup matrix: distanceMatrix_[src][dest] = distance from src to dest (O(1) lookup)
     std::vector<std::vector<Time>> distanceMatrix_;
     
     // Direct device neighbors: NPUs that are directly connected without crossing another device
     std::vector<std::unordered_set<NpuID>> directDeviceNeighbors_;
-    
-    // Direct link transfer times between device neighbors
-    std::vector<std::vector<Time>> directLinkTimes_;  // [src][dst] = transfer time
 
     // helpers
     void computeEdgeTimes_(ChunkSize chunkSize) noexcept;
-    void computeRoutes_(ChunkSize chunkSize) noexcept;
-    void computeDistanceTable_(ChunkSize chunkSize) noexcept;
-    void computeDirectNeighbors_() noexcept;
+    void computeRoutes_(ChunkSize chunkSize) noexcept;  // Also builds directDeviceNeighbors_ and distanceMatrix_
     [[nodiscard]] bool canReserveRoute_(const Route& r, Time t0) const noexcept;
     void reserveRoute_(const Route& r, Time t0) noexcept;
     [[nodiscard]] bool swCapOkAt_(int sid, Time s, Time e, bool isIn) const noexcept;
     void swReserve_(int sid, Time s, Time e, bool isIn) noexcept;
-
-    /// @brief Set the chunk size for the alpha-beta model
-    /// @param chunkSize chunk size in bytes
-    void computeLinkTimes_(ChunkSize chunkSize) noexcept;
 
     /// @brief Alpha-beta model to calculate link transfer time
     /// @param bandwidth bandwidth of the link (in GiB/sec)
