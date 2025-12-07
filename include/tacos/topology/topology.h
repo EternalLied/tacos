@@ -135,11 +135,6 @@ class Topology {
     /// @return latency of the link
     [[nodiscard]] Latency latency(NpuID src, NpuID dest) const noexcept;
 
-    /// @brief Backtrack a destination NPU to find all NPUs that can send a chunk to it
-    /// @param dest destination NPU ID
-    /// @return set of source NPU IDs that can send a chunk to the destination NPU
-    [[nodiscard]] std::vector<NpuID> backtrack(NpuID dest) const noexcept;
-
     /// @brief Get the number of NPUs in the topology
     /// @return number of NPUs
     [[nodiscard]] int npusCount() const noexcept;
@@ -180,9 +175,6 @@ class Topology {
 
     /// @brief link latency of src -> dest (in microseconds)
     std::vector<std::vector<Latency>> latencies_ = {};
-
-    /// @brief set of NPUs that can send a chunk to a given NPU
-    std::unordered_map<NpuID, std::vector<NpuID>> backtrackMap_ = {};
 
     // ===== physical graph (multi-switch) =====
     std::vector<Switch> switches_ = {};

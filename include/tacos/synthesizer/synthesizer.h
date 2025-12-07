@@ -148,16 +148,6 @@ class Synthesizer {
     /// @param dest destination NPU ID
     void adjustPostconditionPriority_(ChunkID chunk, NpuID dest) noexcept;
 
-    /// @brief Filter out chunks that have not yet arrived at their destination NPUs.
-    /// @return map of destination NPUs -> set of chunks that have not yet arrived
-    [[nodiscard]] PostconditionMap filterPostcondition_() const noexcept;
-
-    /// @brief Flatten and shuffle the unsatisfied postcondition
-    /// @param postcondition filtered postcondition map
-    /// @return shuffled vector of unsatisfied postconditions in (chunkID, NpuID) format
-    [[nodiscard]] std::vector<Condition> shufflePostcondition_(
-        const PostconditionMap& postcondition) noexcept;
-
     /// @brief Expand the TEN to the updated current timetsep.
     /// @details During the expansion, the TEN will check which chunk arrived
     /// at the designated destination NPUs, check the replacement opportunities,
@@ -181,16 +171,13 @@ class Synthesizer {
         NpuID src, NpuID dest, const PostconditionMap* postconditionMap) noexcept;
 
     /// @brief Make a link-chunk matching for a given chunk and destination NPU.
-    /// @details This method will backtrack the source NPUs that can send the chunk to the
-    /// destination NPU, and check which source NPUs are available to send the chunk then, it will
-    /// select the best candidate source NPU and mark the source-dest TEN link
-    /// as occupied with transferring the chunk
+    /// @details This method iterates through all source NPUs that have the chunk,
+    /// applies policy filters (AllGather: direct neighbors only; AllToAll: greedy routing),
+    /// and selects the best candidate source NPU to transfer the chunk
     /// @param chunk chunk ID to transfer
     /// @param dest destination NPU ID
-    /// @param backtrackCache cache of backtrack results to avoid repeated computation
     /// @return the selected source NPU (-1 if failed)
-    int linkChunkMatching_(ChunkID chunk, NpuID dest, 
-                          std::unordered_map<NpuID, std::unordered_set<NpuID>>& backtrackCache) noexcept;
+    int linkChunkMatching_(ChunkID chunk, NpuID dest) noexcept;
 
     /// @brief Compare lhs and rhs Time values for equality
     /// @param lhs Time value

@@ -43,12 +43,14 @@ configure() {
 
 build() {
     echo "[TACOS] Building project (with $THREADS threads)..."
-    cmake --build "$BUILD_DIR" --parallel "$THREADS" #--config Release
+    # cmake --build "$BUILD_DIR" --parallel "$THREADS" --config Debug
+    cmake --build "$BUILD_DIR" --parallel "$THREADS" --config Release
 }
 
 run() {
     echo "[TACOS] Running TACOS..."
-    "$BUILD_DIR/bin/Debug/tacos" "$@"
+    # "$BUILD_DIR/bin/Debug/tacos" "$@"
+    "$BUILD_DIR/bin/Release/tacos" "$@"
 }
 
 test() {

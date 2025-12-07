@@ -102,13 +102,9 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
         // This ensures no physical edge is used by multiple routes in the same round
         ten_->clearRoundUsedEdges();
 
-        // Optimization: Cache backtrack results for this timestep
-        // Multiple conditions may have the same destination, so we cache to avoid repeated computation
-        std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
-
         // Matching policy (per-route, no global hop limit):
-        // - If shortest path has no switch, require 1-hop only
-        // - If path includes switches, prioritize fewer hops (no global cap)
+        // - AllGather: Only match direct neighbors (single-hop without crossing devices)
+        // - AllToAll: Greedy routing with minimum distance source selection
         // - Reject routes mixing direct device edges with switch edges
         // All policy logic is implemented inside linkChunkMatching_
 
@@ -116,7 +112,7 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
         PerfLog(perfTimer.start());
         for (const auto [chunk, dest] : sortedPostconditions_) {
             // linkChunkMatching_ returns the selected source NPU, or -1 if failed
-            const auto selectedSrc = linkChunkMatching_(chunk, dest, backtrackCache);
+            const auto selectedSrc = linkChunkMatching_(chunk, dest);
             
             if (selectedSrc >= 0) {
                 // Get the actual route path that was reserved
@@ -306,17 +302,11 @@ void Synthesizer::initializeSortedPostconditions_() noexcept {
     }
     
     // Sort by transfer time (using distanceMatrix_ from TEN)
-    std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
-    
-    auto computeMinTransferTime = [this, &backtrackCache](ChunkID chunk, NpuID dest) -> Time {
+    auto computeMinTransferTime = [this](ChunkID chunk, NpuID dest) -> Time {
         Time minTime = std::numeric_limits<Time>::max();
-        auto it = backtrackCache.find(dest);
-        if (it == backtrackCache.end()) {
-            it = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
-        }
-        const auto& sources = it->second;
-        for (const auto src : sources) {
-            if (chunkMap_[chunk][src]) {
+        // Iterate through all devices to find sources with the chunk
+        for (int src = 0; src < npusCount; ++src) {
+            if (src != dest && chunkMap_[chunk][src]) {
                 Time transferTime = ten_->getDistance(src, dest);
                 minTime = std::min(minTime, transferTime);
             }
@@ -393,13 +383,9 @@ void Synthesizer::adjustPostconditionPriority_(const ChunkID chunk, const NpuID 
     const size_t oldIndex = std::distance(sortedPostconditions_.begin(), it);
     
     // Compute new priority (minimum remaining distance from any source that has the chunk)
-    std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
-    auto backtrackIt = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
-    const auto& sources = backtrackIt->second;
-    
     Time newDistance = std::numeric_limits<Time>::max();
-    for (const auto src : sources) {
-        if (chunkMap_[chunk][src]) {
+    for (int src = 0; src < npusCount; ++src) {
+        if (src != dest && chunkMap_[chunk][src]) {
             Time distance = ten_->getDistance(src, dest);
             newDistance = std::min(newDistance, distance);
         }
@@ -410,14 +396,10 @@ void Synthesizer::adjustPostconditionPriority_(const ChunkID chunk, const NpuID 
     }
     
     // Lambda to compute distance for a given condition
-    auto computeDistance = [this, &backtrackCache](const Condition& cond) -> Time {
-        auto it = backtrackCache.find(cond.second);
-        if (it == backtrackCache.end()) {
-            it = backtrackCache.emplace(cond.second, ten_->backtrack(cond.second)).first;
-        }
+    auto computeDistance = [this](const Condition& cond) -> Time {
         Time minDist = std::numeric_limits<Time>::max();
-        for (const auto src : it->second) {
-            if (chunkMap_[cond.first][src]) {
+        for (int src = 0; src < npusCount; ++src) {
+            if (src != cond.second && chunkMap_[cond.first][src]) {
                 minDist = std::min(minDist, ten_->getDistance(src, cond.second));
             }
         }
@@ -489,116 +471,6 @@ void Synthesizer::adjustPostconditionPriority_(const ChunkID chunk, const NpuID 
     priorityAdjustmentTime_ += duration.count();
     priorityAdjustmentCount_++;
 #endif
-}
-
-Synthesizer::PostconditionMap Synthesizer::filterPostcondition_() const noexcept {
-    auto postconditionMap = PostconditionMap();
-
-    // iterate over all chunks
-    for (auto chunk = 0; chunk < chunksCount_; ++chunk) {
-        // check which destination NPUs have not yet received the chunk
-        const auto dests = collective_->postcondition(chunk);
-        for (const auto dest : dests) {
-            if (!chunkMap_[chunk][dest]) {
-                postconditionMap[dest].insert(chunk);
-            }
-        }
-    }
-
-    return postconditionMap;
-}
-
-std::vector<Synthesizer::Condition> Synthesizer::shufflePostcondition_(
-    const PostconditionMap& postconditionMap) noexcept {
-    
-    // Optimization: Cache backtrack results per destination (significant speedup for large postconditions)
-    std::unordered_map<NpuID, std::unordered_set<NpuID>> backtrackCache;
-    
-    // Helper function to compute minimum physical hop count for a condition
-    // Use physical hops for sorting to avoid Cut-Through routes getting unfair priority
-    auto computeMinPhysicalHops = [this, &backtrackCache](ChunkID chunk, NpuID dest) -> int {
-        int minHops = std::numeric_limits<int>::max();
-        
-        // Get or compute backtrack sources for this destination
-        auto it = backtrackCache.find(dest);
-        if (it == backtrackCache.end()) {
-            it = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
-        }
-        const auto& sources = it->second;
-        
-        for (const auto src : sources) {
-            if (chunkMap_[chunk][src]) {
-                int hops = ten_->getRoutePhysicalHops(src, dest);
-                minHops = std::min(minHops, hops);
-            }
-        }
-        return minHops;
-    };
-    
-    // Step 1: Flatten and precompute physical hop counts (compute once, use multiple times)
-    std::vector<std::pair<Condition, int>> conditionsWithHops;
-    conditionsWithHops.reserve(postconditionMap.size() * 8); // Rough estimate
-    
-    for (const auto& [dest, chunks] : postconditionMap) {
-        for (const auto chunk : chunks) {
-            int minPhysicalHops = computeMinPhysicalHops(chunk, dest);
-            conditionsWithHops.emplace_back(Condition{chunk, dest}, minPhysicalHops);
-        }
-    }
-    
-    // Step 2: Sort by physical hop count (using precomputed values)
-    // Strategy depends on collective type:
-    // - AllGather: Ascending (short paths first) - no intermediate caching needed
-    // - AllToAll: Descending (long paths first) - benefits from progressive intermediate caching
-    const bool useDescendingOrder = (collectiveType_ == CollectiveType::ALL_TO_ALL);
-    
-    std::stable_sort(conditionsWithHops.begin(), conditionsWithHops.end(),
-        [useDescendingOrder](const auto& a, const auto& b) {
-            return useDescendingOrder ? (a.second > b.second) : (a.second < b.second);
-        });
-    
-    // Step 3: Shuffle within same-hop groups (using precomputed values)
-    for (auto it = conditionsWithHops.begin(); it != conditionsWithHops.end(); ) {
-        int currentHops = it->second;
-        
-        // Find end of same-hop-count group
-        auto groupEnd = std::find_if(it, conditionsWithHops.end(),
-            [currentHops](const auto& elem) { 
-                return elem.second != currentHops; 
-            });
-        
-        // Shuffle within this group
-        std::shuffle(it, groupEnd, randomEngine);
-        it = groupEnd;
-    }
-    
-    // Step 4: Extract final postcondition list
-    std::vector<Condition> postcondition;
-    postcondition.reserve(conditionsWithHops.size());
-    
-    // Debug: Print physical hop count distribution (using cached hop counts)
-    std::map<int,int> hopCountDist;
-    DebugLog(
-        for (const auto& [cond, hops] : conditionsWithHops) {
-            if (hops != std::numeric_limits<int>::max()) {
-                hopCountDist[hops]++;
-            }
-        }
-        if (!hopCountDist.empty()) {
-            std::cout << "Postcondition physical hop distribution (ideal): ";
-            for (const auto& [hops, count] : hopCountDist) {
-                std::cout << hops << "-hop:" << count << " ";
-            }
-            std::cout << std::endl;
-            std::cout << "  Note: Actual scheduled hops may be longer due to resource conflicts." << std::endl;
-        }
-    );
-    
-    for (const auto& [cond, _] : conditionsWithHops) {
-        postcondition.push_back(cond);
-    }
-    
-    return postcondition;
 }
 
 std::pair<int, int> Synthesizer::expandTenTimestep_(PostconditionMap* const postconditionMap) noexcept {
@@ -737,23 +609,29 @@ std::optional<Synthesizer::ChunkID> Synthesizer::findReplacementChunk_(
     return candidates[idx];
 }
 
-int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
-                                   std::unordered_map<NpuID, std::unordered_set<NpuID>>& backtrackCache) noexcept {
-    // Get or compute backtrack source NPUs (use cache for performance)
-    auto it = backtrackCache.find(dest);
-    if (it == backtrackCache.end()) {
-        it = backtrackCache.emplace(dest, ten_->backtrack(dest)).first;
-    }
-    const auto& sources = it->second;
-
+int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexcept {
     // Candidate selection: prefer earlier lower distance (1st priority), then fewer physical hops (2nd priority)
     auto minDistance = std::numeric_limits<Time>::max();
     auto minHopCount = std::numeric_limits<int>::max();
     std::vector<NpuID> candidates;
 
-    for (const auto src : sources) {
+    // AllGather optimization: pre-filter sources to direct neighbors only
+    const auto& directNeighbors = (collectiveType_ == CollectiveType::ALL_GATHER) 
+        ? ten_->getDirectDeviceNeighbors(dest) 
+        : std::unordered_set<NpuID>();
+    
+    // Iterate through all devices to find sources with the chunk
+    for (int src = 0; src < npusCount; ++src) {
+        if (src == dest) continue;  // skip self
         if (!chunkMap_[chunk][src]) {
             continue;  // source does not have the chunk
+        }
+
+        // AllGather: only consider direct neighbors (single-hop without crossing devices)
+        if (collectiveType_ == CollectiveType::ALL_GATHER) {
+            if (directNeighbors.count(src) == 0) {
+                continue;  // not a direct neighbor
+            }
         }
 
         const auto hopCount = ten_->getRoutePhysicalHops(src, dest);
@@ -761,25 +639,7 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest,
             continue;  // invalid route
         }
 
-        // const auto linkWeight = ten_->getDistance(src, dest);
-        // const auto linkTime = currentTime_ + linkWeight;
         const auto distance = ten_->getDistance(src, dest);
-
-        // Policy enforcement per-collective
-        const bool hasSwitchInTopology = ten_->hasSwitches();
-        const bool routeThroughSwitch = ten_->routeHasSwitch(src, dest);
-        const bool hasMixedEdges = ten_->routeHasMixedEdges(src, dest);
-
-        if (collectiveType_ == CollectiveType::ALL_GATHER) {
-            if (!hasSwitchInTopology && hopCount != 1) continue;
-            if (!routeThroughSwitch && hopCount != 1) continue;
-            if (hasMixedEdges) continue;
-        } else if (collectiveType_ != CollectiveType::ALL_TO_ALL) {
-            // Unknown collective: conservative policy
-            if (!hasSwitchInTopology && hopCount != 1) continue;
-            if (!routeThroughSwitch && hopCount != 1) continue;
-            if (hasMixedEdges) continue;
-        }
 
         // Priority 1: Earlier distance (lower distance is better)
         // Priority 2: Fewer physical hops (lower hopCount is better)

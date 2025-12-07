@@ -124,7 +124,7 @@ std::optional<Topology> createTopology(const std::string& topologyName) {
     
     auto topology = it->second();
     
-    // Call finalizeReachability_() to compute GPU-to-GPU reachability and backtrack maps
+    // Call finalizeReachability_() to compute GPU-to-GPU reachability from physical graph
     // This is essential and must be called before using the topology for scheduling
     topology.finalizeReachability_();
     

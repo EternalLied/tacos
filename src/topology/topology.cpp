@@ -26,10 +26,6 @@ void Topology::setNpusCount_(const int npusCount) noexcept {
     latencies_ = decltype(latencies_)(npusCount, std::vector<Latency>(npusCount, 0));
     bandwidths_ = decltype(bandwidths_)(npusCount, std::vector<Bandwidth>(npusCount, 0));
 
-    for (auto dest = 0; dest < npusCount; ++dest) {
-        backtrackMap_[dest] = {};
-    }
-
     // reset physical graph (switches/links can be re-added)
     switches_.clear();
     switchesCount_ = 0;
@@ -53,13 +49,6 @@ Topology::Latency Topology::latency(NpuID src, NpuID dest) const noexcept {
     return latencies_[src][dest];
 }
 
-std::vector<Topology::NpuID> Topology::backtrack(const NpuID dest) const noexcept {
-    assert(0 <= dest && dest < npusCount_);
-    assert(backtrackMap_.size() == npusCount_);
-
-    return backtrackMap_.at(dest);
-}
-
 void Topology::connect_(const NpuID src,
                         const NpuID dest,
                         Bandwidth bandwidth,
@@ -74,7 +63,6 @@ void Topology::connect_(const NpuID src,
     connected_[src][dest] = true;
     bandwidths_[src][dest] = bandwidth;
     latencies_[src][dest] = latency;
-    backtrackMap_[dest].push_back(src);
 
     if (bidirectional) {
         // connect dest -> src (if bi-directional)
@@ -165,7 +153,6 @@ void Topology::finalizeReachability_() noexcept {
             bandwidths_[u][v] = bandwidths_[u][v];
             latencies_[u][v] = latencies_[u][v];
         }
-        backtrackMap_[u].clear();
     }
     // BFS/Dijkstra over physical graph to check reachability
     const int T = totalNodes();
@@ -188,7 +175,6 @@ void Topology::finalizeReachability_() noexcept {
             if (s == t) continue;
             if (seen[t]) {
                 connected_[s][t] = true;
-                backtrackMap_[t].push_back(s);
                 // bandwidth/latency at GPU-level is only for "estimation"; actual scheduling is calculated by TEN along the path
                 // Keep 0 here; TEN's shortest path calculation will fill in the actual end-to-end time
             }

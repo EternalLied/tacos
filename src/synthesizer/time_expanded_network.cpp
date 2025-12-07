@@ -82,24 +82,10 @@ int TimeExpandedNetwork::routeHopCount(const NpuID src, const NpuID dest) const 
     return route.logicalHops;
 }
 
-std::unordered_set<TimeExpandedNetwork::NpuID> TimeExpandedNetwork::backtrack(
-    const NpuID dest) noexcept {
-    assert(0 <= dest && dest < npusCount_);
-
-    // list of available source NPUs
-    auto sources = std::unordered_set<NpuID>();
-
-    // filter the available sources from the topology backtracking + route feasibility
-    for (const auto src : topology_.backtrack(dest)) {
-        if (!available_[src][dest]) continue; // gpu-level busy
-        const auto& r = routes_[src][dest];
-        if (r.nodes.empty()) continue;
-        if (canReserveRoute_(r, currentTime_)) {
-            sources.insert(src);
-        }
-    }
-
-    return sources;
+const std::unordered_set<TimeExpandedNetwork::NpuID>& 
+TimeExpandedNetwork::getDirectDeviceNeighbors(const NpuID device) const noexcept {
+    assert(0 <= device && device < npusCount_);
+    return directDeviceNeighbors_[device];
 }
 
 void TimeExpandedNetwork::timestep(const Time time) noexcept {
@@ -144,38 +130,6 @@ bool TimeExpandedNetwork::canReserveRoute(const NpuID src, const NpuID dest) con
     if (route.nodes.empty()) return false;
     
     return canReserveRoute_(route, currentTime_);
-}
-
-bool TimeExpandedNetwork::routeHasSwitch(const NpuID src, const NpuID dest) const noexcept {
-    if (src < 0 || src >= static_cast<int>(routes_.size())) return false;
-    if (dest < 0 || dest >= static_cast<int>(routes_[src].size())) return false;
-    const auto& r = routes_[src][dest];
-    if (r.nodes.size() < 2) return false;
-    for (size_t i = 1; i < r.nodes.size(); ++i) {
-        const int u = r.nodes[i-1];
-        const int v = r.nodes[i];
-        const int sid_u = topology_.switchIdFromNode(u);
-        const int sid_v = topology_.switchIdFromNode(v);
-        if (sid_u >= 0 || sid_v >= 0) return true;
-    }
-    return false;
-}
-
-bool TimeExpandedNetwork::routeHasMixedEdges(const NpuID src, const NpuID dest) const noexcept {
-    if (src < 0 || src >= static_cast<int>(routes_.size())) return false;
-    if (dest < 0 || dest >= static_cast<int>(routes_[src].size())) return false;
-    const auto& r = routes_[src][dest];
-    if (r.nodes.size() < 2) return false;
-    bool hasSwitchEdge = false;
-    bool hasDirectEdge = false;
-    for (size_t i = 1; i < r.nodes.size(); ++i) {
-        const int u = r.nodes[i-1];
-        const int v = r.nodes[i];
-        const bool isSwitchEdge = (topology_.switchIdFromNode(u) >= 0) || (topology_.switchIdFromNode(v) >= 0);
-        if (isSwitchEdge) hasSwitchEdge = true; else hasDirectEdge = true;
-        if (hasSwitchEdge && hasDirectEdge) return true;
-    }
-    return false;
 }
 
 void TimeExpandedNetwork::clearRoundUsedEdges() noexcept {
@@ -274,29 +228,6 @@ double TimeExpandedNetwork::getLinkUtilization(const int src, const int dest, co
     // Use accumulated busy time for physical edge utilization
     const Time busyTime = edgeAccumulatedBusyTime_[src][dest];
     return static_cast<double>(busyTime) / static_cast<double>(totalTime);
-}
-
-int TimeExpandedNetwork::getFirstIntermediateDevice(const NpuID src, const NpuID dest) const noexcept {
-    if (src < 0 || src >= npusCount_ || dest < 0 || dest >= npusCount_) {
-        return -1;
-    }
-    
-    const auto& route = routes_[src][dest];
-    if (route.nodes.size() < 3) {
-        // No intermediate nodes (direct connection or too short)
-        return -1;
-    }
-    
-    // Search for first intermediate device node (excluding src and dest)
-    for (size_t i = 1; i < route.nodes.size() - 1; ++i) {
-        int nodeIdx = route.nodes[i];
-        // Check if this node is a device (not a switch)
-        if (nodeIdx < npusCount_) {
-            return nodeIdx;
-        }
-    }
-    
-    return -1; // No intermediate device found
 }
 
 void TimeExpandedNetwork::transferChunkPartial(const NpuID src, 
@@ -452,57 +383,7 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
         return r;
     };
     
-    // Random number generator for path selection (to explore different equal-cost paths)
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<double> dis(0.0, 1.0);
-    
-    for (int sGPU = 0; sGPU < npusCount_; ++sGPU) {
-        const int s = sGPU; // deviceNode == GPU id
-        std::vector<Time> dist(N, std::numeric_limits<Time>::max()/4);
-        std::vector<int>  prev(N, -1);
-        using QN = std::pair<Time,int>;
-        std::priority_queue<QN, std::vector<QN>, std::greater<QN>> pq;
-        dist[s] = 0; pq.push({0,s});
-        
-        // Epsilon for floating-point comparison
-        constexpr Time epsilon = 1e-9;
-        
-        while(!pq.empty()) {
-            auto [du,u] = pq.top(); pq.pop();
-            if (du > dist[u] + epsilon) continue;  // Use epsilon comparison
-            
-            for (auto [v,w] : adj[u]) {
-                Time newDist = du + w;
-                
-                if (dist[v] > newDist + epsilon) {
-                    // Found strictly better path
-                    dist[v] = newDist; 
-                    prev[v] = u; 
-                    pq.push({dist[v], v});
-                } else if (std::abs(dist[v] - newDist) <= epsilon) {
-                    // Found equal-cost path - randomly decide whether to replace
-                    // This allows exploring different equal-cost paths across multiple runs
-                    if (dis(gen) < 0.5) {
-                        prev[v] = u;  // Replace with new path with 50% probability
-                    }
-                    // Note: We don't push to pq again since distance didn't improve
-                }
-            }
-        }
-        for (int tGPU = 0; tGPU < npusCount_; ++tGPU) {
-            if (sGPU == tGPU) continue;
-            if (!topology_.connected(sGPU, tGPU)) continue;
-            const int t = tGPU;
-            routes_[sGPU][tGPU] = reconstruct(s, t, prev);
-            
-            // Populate distanceMatrix_ with precomputed shortest path distance
-            // Use dist[t] directly from Dijkstra result (equivalent to route total time)
-            distanceMatrix_[sGPU][tGPU] = dist[t];
-        }
-    }
-    
-    // Build directDeviceNeighbors_ (merged here to avoid redundant graph traversal)
+    // Build directDeviceNeighbors_ first (needed to decide which routes to store)
     directDeviceNeighbors_.assign(npusCount_, std::unordered_set<NpuID>());
     for (int u = 0; u < npusCount_; ++u) {
         for (int v = 0; v < npusCount_; ++v) {
@@ -546,6 +427,63 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
             if (isDirectNeighbor) {
                 directDeviceNeighbors_[u].insert(v);
             }
+        }
+    }
+    
+    // Now run Dijkstra once per source to populate both distanceMatrix_ and routes_
+    // Random number generator for path selection (to explore different equal-cost paths)
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> dis(0.0, 1.0);
+    
+    for (int sGPU = 0; sGPU < npusCount_; ++sGPU) {
+        const int s = sGPU; // deviceNode == GPU id
+        std::vector<Time> dist(N, std::numeric_limits<Time>::max()/4);
+        std::vector<int>  prev(N, -1);
+        using QN = std::pair<Time,int>;
+        std::priority_queue<QN, std::vector<QN>, std::greater<QN>> pq;
+        dist[s] = 0; pq.push({0,s});
+        
+        // Epsilon for floating-point comparison
+        constexpr Time epsilon = 1e-9;
+        
+        while(!pq.empty()) {
+            auto [du,u] = pq.top(); pq.pop();
+            if (du > dist[u] + epsilon) continue;  // Use epsilon comparison
+            
+            for (auto [v,w] : adj[u]) {
+                Time newDist = du + w;
+                
+                if (dist[v] > newDist + epsilon) {
+                    // Found strictly better path
+                    dist[v] = newDist; 
+                    prev[v] = u; 
+                    pq.push({dist[v], v});
+                } else if (std::abs(dist[v] - newDist) <= epsilon) {
+                    // Found equal-cost path - randomly decide whether to replace
+                    // This allows exploring different equal-cost paths across multiple runs
+                    if (dis(gen) < 0.5) {
+                        prev[v] = u;  // Replace with new path with 50% probability
+                    }
+                    // Note: We don't push to pq again since distance didn't improve
+                }
+            }
+        }
+        
+        // Populate distanceMatrix_ for all reachable GPUs (for distance lookups)
+        for (int tGPU = 0; tGPU < npusCount_; ++tGPU) {
+            if (sGPU == tGPU) continue;
+            if (!topology_.connected(sGPU, tGPU)) continue;
+            const int t = tGPU;
+            
+            // Always populate distanceMatrix_ for all pairs (needed for distance lookups)
+            distanceMatrix_[sGPU][tGPU] = dist[t];
+        }
+        
+        // Only reconstruct and store routes to direct neighbors
+        for (int tGPU : directDeviceNeighbors_[sGPU]) {
+            const int t = tGPU;
+            routes_[sGPU][tGPU] = reconstruct(s, t, prev);
         }
     }
 }

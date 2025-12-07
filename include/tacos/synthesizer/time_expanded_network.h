@@ -46,11 +46,6 @@ class TimeExpandedNetwork {
     /// @return number of hops (edges) in the route, or -1 if no route exists
     [[nodiscard]] int routeHopCount(NpuID src, NpuID dest) const noexcept;
 
-    /// @brief Backtrack the TEN and return the list of available source NPUs to dest
-    /// @param dest destination NPU ID
-    /// @return list of source NPUs available at current timestep
-    std::unordered_set<NpuID> backtrack(NpuID dest) noexcept;
-
     /// @brief Occupy a link between two NPUs
     /// @details i.e., mark the link as unavailable for the current timestep.
     /// @param src source NPU ID
@@ -113,12 +108,6 @@ class TimeExpandedNetwork {
     /// @return true if the route is available, false otherwise
     [[nodiscard]] bool canReserveRoute(NpuID src, NpuID dest) const noexcept;
 
-    /// @brief Find the first intermediate device node in a route (for partial reservation)
-    /// @param src source NPU ID
-    /// @param dest destination NPU ID
-    /// @return node index of first intermediate device, or -1 if no intermediate device
-    [[nodiscard]] int getFirstIntermediateDevice(NpuID src, NpuID dest) const noexcept;
-
     /// @brief Find best available next hop for AllToAll greedy routing
     /// @details Selects neighbor that is closer to dest and has available link.
     ///          Checks route availability and falls back to suboptimal routes if needed.
@@ -133,6 +122,13 @@ class TimeExpandedNetwork {
     /// @param dest destination NPU ID
     /// @return transfer time, or max if unreachable
     [[nodiscard]] Time getDistance(NpuID src, NpuID dest) const noexcept;
+    
+    /// @brief Get the set of direct device neighbors for a given device
+    /// @details A direct neighbor is reachable via a single-hop path without crossing other devices
+    ///          (may go through switches but no intermediate devices)
+    /// @param device device NPU ID
+    /// @return set of direct device neighbor IDs
+    [[nodiscard]] const std::unordered_set<NpuID>& getDirectDeviceNeighbors(NpuID device) const noexcept;
 
     /// @brief Transfer chunk using partial route (only to first intermediate device)
     /// @details For AllToAll multi-hop optimization: reserve only src->intermediate segment
@@ -152,12 +148,6 @@ class TimeExpandedNetwork {
   [[nodiscard]] bool nodeIsSwitch(int nodeIndex) const noexcept {
     return topology_.switchIdFromNode(nodeIndex) >= 0;
   }
-
-  /// @brief Whether the precomputed shortest route between GPUs traverses any switch
-  [[nodiscard]] bool routeHasSwitch(NpuID src, NpuID dest) const noexcept;
-
-  /// @brief Whether the route contains both direct device-to-device edges and switch edges
-  [[nodiscard]] bool routeHasMixedEdges(NpuID src, NpuID dest) const noexcept;
 
   private:
     /// @brief current timestep
