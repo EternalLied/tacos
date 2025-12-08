@@ -24,11 +24,6 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     npusCount_ = topology_.npusCount();
     totalNodes_ = topology_.totalNodes();
 
-    // initialize TEN lists
-    linkBusyUntil_ = decltype(linkBusyUntil_)(npusCount_, std::vector<Time>(npusCount_, -1));
-    chunk_ = decltype(chunk_)(npusCount_, std::vector<ChunkID>(npusCount_, -1));
-    available_ = decltype(available_)(npusCount_, std::vector<bool>(npusCount_, false));
-
     // physical graph resources
     edgeBusyUntil_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
     edgeDelta_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
@@ -65,19 +60,9 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
 
     // Initialize round-used edges tracker
     roundUsedEdges_.assign(totalNodes_, std::vector<char>(totalNodes_, 0));
-
-    for (int u = 0; u < npusCount_; ++u)
-      for (int v = 0; v < npusCount_; ++v)
-        available_[u][v] = topology_.connected(u, v);
 }
 
-bool TimeExpandedNetwork::available(const NpuID src, const NpuID dest) const noexcept {
-    assert(0 <= src && src < npusCount_);
-    assert(0 <= dest && dest < npusCount_);
 
-    // return true if the link is available at the current timestep
-    return available_[src][dest];
-}
 
 int TimeExpandedNetwork::routeHopCount(const NpuID src, const NpuID dest) const noexcept {
     assert(0 <= src && src < npusCount_);
@@ -102,34 +87,12 @@ TimeExpandedNetwork::getDirectDeviceNeighbors(const NpuID device) const noexcept
 
 void TimeExpandedNetwork::timestep(const Time time) noexcept {
     assert(time > currentTime_);
-
     // update the current timestep
     currentTime_ = time;
-
-    // reset the availability of all links
-    for (auto src = 0; src < npusCount_; ++src) {
-        for (auto dest = 0; dest < npusCount_; ++dest) {
-            // if link is still busy, keep it unavailable
-            const auto busyUntil = linkBusyUntil_[src][dest];
-            if (busyUntil > currentTime_) {
-                available_[src][dest] = false;
-                continue;
-            }
-
-            // otherwise, reset the link availability
-            available_[src][dest] = topology_.connected(src, dest);
-        }
-    }
+    // Note: Physical layer (edgeBusyUntil_) is checked dynamically in canReserveRoute_
 }
 
-TimeExpandedNetwork::ChunkID TimeExpandedNetwork::chunk(const NpuID src,
-                                                        const NpuID dest) const noexcept {
-    assert(0 <= src && src < npusCount_);
-    assert(0 <= dest && dest < npusCount_);
 
-    // return the chunk ID being transferred over the link
-    return chunk_[src][dest];
-}
 
 bool TimeExpandedNetwork::canReserveRoute(const NpuID src, const NpuID dest) const noexcept {
     assert(0 <= src && src < npusCount_);
@@ -160,30 +123,15 @@ void TimeExpandedNetwork::transferChunk(const NpuID src,
     assert(chunk >= 0);
     assert(time >= currentTime_);
 
-    // assert link is currently available and free
-    assert(available_[src][dest]);
-    assert(linkBusyUntil_[src][dest] < 0);
-
-    // reserve physical route now (atomic multi-segment)
+    // Reserve physical route (checks should have been done via canReserveRoute)
     const auto& r = routes_[src][dest];
     reserveRoute_(r, currentTime_);
-    // mark GPU-level virtual link
-    available_[src][dest] = false;
-    chunk_[src][dest] = chunk;
-    linkBusyUntil_[src][dest] = time;
-
+    
+    // Record chunk arrival event with source information
+    pendingArrivals_.emplace(time, Arrival{chunk, src, dest});
 }
 
-void TimeExpandedNetwork::transferFinished(const NpuID src, const NpuID dest) noexcept {
-    assert(0 <= src && src < npusCount_);
-    assert(0 <= dest && dest < npusCount_);
 
-    // reset the link busy time and chunk
-    available_[src][dest] = true;
-    linkBusyUntil_[src][dest] = -1;
-    chunk_[src][dest] = -1;
-
-}
 
 std::vector<int> TimeExpandedNetwork::getRoutePath(const NpuID src, const NpuID dest) const noexcept {
     assert(0 <= src && src < npusCount_);
@@ -265,10 +213,25 @@ void TimeExpandedNetwork::transferChunkPartial(const NpuID src,
     // Reserve the partial route's physical resources
     reserveRoute_(partialRoute, currentTime_);
     
-    // Mark virtual link src->intermediate as busy
-    available_[src][intermediate] = false;
-    chunk_[src][intermediate] = chunk;
-    linkBusyUntil_[src][intermediate] = time;
+    // Record chunk arrival at intermediate node with source information
+    pendingArrivals_.emplace(time, Arrival{chunk, src, intermediate});
+}
+
+std::vector<std::tuple<TimeExpandedNetwork::ChunkID, TimeExpandedNetwork::NpuID, TimeExpandedNetwork::NpuID>> 
+TimeExpandedNetwork::getArrivalsAt(Time time) noexcept {
+    std::vector<std::tuple<ChunkID, NpuID, NpuID>> arrivals;
+    
+    // Find all arrivals at this time
+    auto range = pendingArrivals_.equal_range(time);
+    for (auto it = range.first; it != range.second; ++it) {
+        const auto& arrival = it->second;
+        arrivals.push_back(std::make_tuple(arrival.chunk, arrival.src, arrival.dest));
+    }
+    
+    // Remove processed arrivals
+    pendingArrivals_.erase(range.first, range.second);
+    
+    return arrivals;
 }
 
 // ===== helpers =====

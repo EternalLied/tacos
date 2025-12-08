@@ -485,81 +485,63 @@ std::pair<int, int> Synthesizer::expandTenTimestep_(PostconditionMap* const post
     int replacedCount = 0;
     int discardedCount = 0;
 
-    // for every src-dest pairs
-    for (auto src = 0; src < npusCount; src++) {
-        for (auto dest = 0; dest < npusCount; dest++) {
-            // if TEN is not available, skip
-            // i.e., link doesn't exist or it is busy transferring a chunk
-            if (!ten_->available(src, dest)) {
-                continue;
-            }
-
-            // if a TEN link is available, there are two cases:
-            // 1. the TEN link is indeed free, or
-            // 2. it just become free by finishing a transfer
-            // for case 2, we should mark this transfer as finished
-            // and check for replacement possibilities
-
-            // for case 1 (link is free), we can skip this
-            auto chunk = ten_->chunk(src, dest);
-            if (chunk < 0) {
-                continue;
-            }
-
-            // for case 2, check if the chunk has already arrived at dest
-            // by following other paths
-            // and if so, check if we can replace this path with another chunk
-            if (chunkMap_[chunk][dest]) {
-                // Check if dest is actually a final destination for this chunk
-                // For AllToAll: dest might just be an intermediate node, not the final target
-                // For AllGather: all nodes are final destinations
-                const auto& postconditions = collective_->postcondition(chunk);
-                const bool isActualDestination = std::find(
-                    postconditions.begin(), 
-                    postconditions.end(), 
-                    dest
-                ) != postconditions.end();
+    // === PHASE 1: Process chunk arrivals at current time ===
+    // Get all chunks that arrive at this timestep
+    auto arrivals = ten_->getArrivalsAt(currentTime_);
+    
+    // === PHASE 2: Replacement optimization ===
+    // For each arrival, check if we need replacement optimization
+    for (const auto& [chunk, src, dest] : arrivals) {
+        auto finalChunk = chunk;
+        
+        // Check if this chunk has already arrived at dest via another path
+        if (chunkMap_[chunk][dest]) {
+            // Check if dest is actually a final destination for this chunk
+            const auto& postconditions = collective_->postcondition(chunk);
+            const bool isActualDestination = std::find(
+                postconditions.begin(),
+                postconditions.end(),
+                dest
+            ) != postconditions.end();
+            
+            if (isActualDestination) {
+                // dest is a final destination and already has this chunk
+                // Try to find a replacement chunk that dest still needs
+                const auto replacementChunk = findReplacementChunk_(src, dest, postconditionMap);
                 
-                if (isActualDestination) {
-                    // dest is a final destination and has already received this chunk
-                    // so we can replace it with another chunk that dest needs
-                    const auto replacementChunk = findReplacementChunk_(src, dest, postconditionMap);
-
-                    if (!replacementChunk.has_value()) {
-                        // no replacement candidate found
-                        // just mark this TEN link as available and skip
-                        ten_->transferFinished(src, dest);
-                        ++discardedCount;
-                        continue;
-                    }
-
-                    // replacement candidate found
-                    chunk = replacementChunk.value();
+                if (replacementChunk.has_value()) {
+                    // Found a replacement - use it instead
+                    finalChunk = replacementChunk.value();
                     ++replacedCount;
+                    
+                    DebugLog(std::cout << "Replaced: Chunk " << chunk << " -> " << finalChunk 
+                             << " at GPU" << dest << std::endl);
                 } else {
-                    // dest is just an intermediate node (for AllToAll multi-hop routing)
-                    // The chunk should continue to its final destination
-                    // Do NOT replace it - let it proceed normally
+                    // No replacement found - this arrival is wasted
+                    ++discardedCount;
+                    
+                    DebugLog(std::cout << "Discarded: Chunk " << chunk << " at GPU" << dest 
+                             << " (already arrived)" << std::endl);
+                    continue;  // Don't mark anything
                 }
             }
-
-            // a meaningful chunk (regardless of replacement) has arrived at dest
-            eventHappened = true;
-
-            // mark the chunk arrived at dest, and mark this TEN link as available
-            chunkMap_[chunk][dest] = true;
-            ten_->transferFinished(src, dest);
-
-            // mark this postcondition as satisfied
-            // i.e., remove this chunk from the postcondition map
-            auto it = postconditionMap->find(dest);
-            if (it != postconditionMap->end()) {
-                it->second.erase(chunk);
-                if (it->second.empty()) {
-                    postconditionMap->erase(it);
-                }
+            // If not actual destination (intermediate node), process normally
+        }
+        
+        // Mark the final chunk as arrived at destination
+        chunkMap_[finalChunk][dest] = true;
+        eventHappened = true;
+        
+        // Update postcondition map
+        auto it = postconditionMap->find(dest);
+        if (it != postconditionMap->end()) {
+            it->second.erase(finalChunk);
+            if (it->second.empty()) {
+                postconditionMap->erase(it);
             }
         }
+        
+        DebugLog(std::cout << "Chunk " << finalChunk << " arrived at GPU" << dest << std::endl);
     }
 
     // at the end of the TEN expansion
@@ -708,7 +690,7 @@ bool Synthesizer::tryAllToAllRouting_(const ChunkID chunk, const NpuID selectedS
         const auto directArrival = currentTime_ + ten_->getDistance(selectedSrc, dest);
         ten_->transferChunk(selectedSrc, dest, chunk, directArrival);
         eventQueue_.schedule(directArrival);
-        // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
+        // Chunk arrival will be marked in expandTenTimestep_() when the event fires
         return true;
     }
     
@@ -716,7 +698,7 @@ bool Synthesizer::tryAllToAllRouting_(const ChunkID chunk, const NpuID selectedS
     const auto greedyArrivalTime = currentTime_ + ten_->getDistance(selectedSrc, greedyNextHop);
     ten_->transferChunkPartial(selectedSrc, greedyNextHop, chunk, greedyArrivalTime);
     eventQueue_.schedule(greedyArrivalTime);
-    // Do NOT mark chunkMap here - will be marked when chunk arrives at intermediate node in expandTenTimestep_
+    // Chunk arrival will be marked in expandTenTimestep_() when the event fires
     
     DebugLog(
         std::cout << "  [AllToAll] Partial (greedy-only): Chunk " << chunk
@@ -740,7 +722,7 @@ bool Synthesizer::tryAllGatherRouting_(const ChunkID chunk, const NpuID selected
     const auto transferArrivalTime = currentTime_ + ten_->getDistance(selectedSrc, dest);
     ten_->transferChunk(selectedSrc, dest, chunk, transferArrivalTime);
     eventQueue_.schedule(transferArrivalTime);
-    // Do NOT mark chunkMap here - will be marked when chunk actually arrives in expandTenTimestep_
+    // Chunk arrival will be marked in expandTenTimestep_() when the event fires
     
     return true;
 }

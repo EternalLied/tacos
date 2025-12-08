@@ -15,6 +15,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 #include <unordered_map>
 #include <utility>
 #include <limits>
+#include <map>
 
 namespace tacos {
 
@@ -33,12 +34,6 @@ class TimeExpandedNetwork {
     /// @param topology target network topology
     TimeExpandedNetwork(const Topology& topology, ChunkSize chunkSize) noexcept;
 
-    /// @brief Check if a link is available at the current timestep
-    /// @param src source NPU ID
-    /// @param dest destination NPU ID
-    /// @return true if the TEN link is available, false otherwise
-    [[nodiscard]] bool available(NpuID src, NpuID dest) const noexcept;
-
     /// @brief Retrieve the chunk transfer time between two NPUs
     /// @brief Get the number of hops in the route from src to dest
     /// @param src source NPU ID
@@ -53,29 +48,22 @@ class TimeExpandedNetwork {
     void disable(NpuID src, NpuID dest) noexcept;
 
     /// @brief Reset to a new timestep
-    /// @details This resets the availability of all links in the network
+    /// @details Updates currentTime_ for physical layer checks
     /// @param nextTime next timestep to set
     void timestep(Time time) noexcept;
 
-    /// @brief Get the chunk currently being trasferred over a link
-    /// @details If the link is currently free, returns a negative number.
+    /// @brief Reserve a chunk transfer over a route
+    /// @details Reserves physical resources (edges and switch ports) for the route
     /// @param src source NPU ID
     /// @param dest destination NPU ID
-    /// @return chunk ID being transferred over the link
-    [[nodiscard]] ChunkID chunk(NpuID src, NpuID dest) const noexcept;
-
-    /// @brief Mark a chunk as being transferred over a link
-    /// @param src source NPU ID
-    /// @param dest destination NPU ID
-    /// @param chunk chunk ID being transferred over the link
-    /// @param time time until which the link is busy
+    /// @param chunk chunk ID being transferred
+    /// @param time arrival time when chunk reaches destination
     void transferChunk(NpuID src, NpuID dest, ChunkID chunk, Time time) noexcept;
 
-    /// @brief Mark a chunk transfer as finished over a link
-    /// @details This resets the chunk information and link busy time.
-    /// @param src source NPU ID
-    /// @param dest destination NPU ID
-    void transferFinished(NpuID src, NpuID dest) noexcept;
+    /// @brief Get all chunk arrivals at the given time
+    /// @param time the query time
+    /// @return vector of (chunk, src, dest) tuples that arrive at this time
+    [[nodiscard]] std::vector<std::tuple<ChunkID, NpuID, NpuID>> getArrivalsAt(Time time) noexcept;
 
     /// @brief Get the route (path) from src to dest
     /// @param src source NPU ID
@@ -160,17 +148,6 @@ class TimeExpandedNetwork {
     int npusCount_ = -1;
     int totalNodes_ = 0; // devices + switches
 
-    /// @brief true if src-dest link is available at the current timestep
-    std::vector<std::vector<bool>> available_;
-
-    /// @brief time until which the link src-dest is busy
-    /// @details if the link is free, the value is negative.
-    std::vector<std::vector<Time>> linkBusyUntil_;
-
-    /// @brief current chunk being transferred over the link src-dest
-    /// @details if the link is free, the value is negative.
-    std::vector<std::vector<ChunkID>> chunk_;
-
     // ===== Multi-switch physical resources =====
     struct EdgeKey { int u; int v; };
     // busy-until on physical directed edges (device/switch graph)
@@ -213,6 +190,12 @@ class TimeExpandedNetwork {
     
     // Direct device neighbors: NPUs that are directly connected without crossing another device
     std::vector<std::unordered_set<NpuID>> directDeviceNeighbors_;
+
+    // === Chunk Arrival Tracking (Physical Layer) ===
+    // Maps arrival time to list of (chunk, src, dest) tuples
+    // When transferChunk() schedules a transfer, it records when and where the chunk will arrive
+    struct Arrival { ChunkID chunk; NpuID src; NpuID dest; };
+    std::multimap<Time, Arrival> pendingArrivals_;
 
     // helpers
     void computeEdgeTimes_(ChunkSize chunkSize) noexcept;
