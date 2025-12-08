@@ -286,11 +286,22 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
     // Dijkstra per source GPU
     const int N = totalNodes_;
     routes_.assign(npusCount_, std::vector<Route>(npusCount_));
-    // adjacency
+    // Build CUT_THROUGH-aware adjacency: for each u→SW→w path where SW is CUT_THROUGH,
+    // add virtual edge u→w with pipelined time = max(d1, d2)
     std::vector<std::vector<std::pair<int, Time>>> adj(N);
     for (int u = 0; u < N; ++u) {
         for (int v = 0; v < N; ++v) if (hasEdge_[u][v]) {
-            adj[u].push_back({v, edgeDelta_[u][v]});
+            int sid = topology_.switchIdFromNode(v);
+            if (sid >= 0 && topology_.switchAt(sid).forwardingMode == SwitchForwardingMode::CUT_THROUGH) {
+                // v is CUT_THROUGH switch: add virtual edges u→w for all neighbors w of v
+                for (int w = 0; w < N; ++w) if (hasEdge_[v][w] && w != u) {
+                    Time pipel = std::max(edgeDelta_[u][v], edgeDelta_[v][w]);
+                    adj[u].push_back({w, pipel});
+                }
+            } else {
+                // Not a CUT_THROUGH switch or regular node: add physical edge
+                adj[u].push_back({v, edgeDelta_[u][v]});
+            }
         }
     }
     
@@ -364,20 +375,42 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
     auto reconstruct = [&](int s, int t, const std::vector<int>& prev) {
         Route r;
         if (prev[t] < 0) return r;
-        std::vector<int> path;
-        for (int x = t; x != -1; x = prev[x]) path.push_back(x);
-        std::reverse(path.begin(), path.end());
-        r.nodes = path;
         
-        // Compute total time and logical hops based on switch mode
-        auto [totalTime, logicalHops] = computeRouteTime(path);
+        // Build Dijkstra path
+        std::vector<int> dijkstraPath;
+        for (int x = t; x != -1; x = prev[x]) dijkstraPath.push_back(x);
+        std::reverse(dijkstraPath.begin(), dijkstraPath.end());
+        
+        // Expand virtual CUT_THROUGH edges to physical path
+        std::vector<int> physicalPath;
+        for (size_t i = 0; i < dijkstraPath.size(); ++i) {
+            int u = dijkstraPath[i];
+            physicalPath.push_back(u);
+            
+            if (i + 1 < dijkstraPath.size()) {
+                int w = dijkstraPath[i + 1];
+                // If no direct edge u→w, insert CUT_THROUGH switch
+                if (!hasEdge_[u][w]) {
+                    for (int sw = npusCount_; sw < totalNodes_; ++sw) {
+                        if (hasEdge_[u][sw] && hasEdge_[sw][w]) {
+                            int sid = topology_.switchIdFromNode(sw);
+                            if (sid >= 0 && topology_.switchAt(sid).forwardingMode == SwitchForwardingMode::CUT_THROUGH) {
+                                physicalPath.push_back(sw);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        r.nodes = physicalPath;
+        auto [totalTime, logicalHops] = computeRouteTime(physicalPath);
         r.logicalHops = logicalHops;
-        r.physicalHops = static_cast<int>(path.size()) - 1; // Cache physical hops
+        r.physicalHops = static_cast<int>(physicalPath.size()) - 1;
         
-        // Still store per-edge deltas for reservation purposes
-        for (size_t i = 1; i < path.size(); ++i) {
-            int u = path[i-1], v = path[i];
-            r.deltas.push_back(edgeDelta_[u][v]);
+        for (size_t i = 1; i < physicalPath.size(); ++i) {
+            r.deltas.push_back(edgeDelta_[physicalPath[i-1]][physicalPath[i]]);
         }
         
         return r;
@@ -470,20 +503,17 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
             }
         }
         
-        // Populate distanceMatrix_ for all reachable GPUs (for distance lookups)
+        // Populate distanceMatrix_ for all reachable GPUs
+        // Dijkstra distances are already CUT_THROUGH-aware from adjacency list
         for (int tGPU = 0; tGPU < npusCount_; ++tGPU) {
-            if (sGPU == tGPU) continue;
-            if (!topology_.connected(sGPU, tGPU)) continue;
-            const int t = tGPU;
-            
-            // Always populate distanceMatrix_ for all pairs (needed for distance lookups)
-            distanceMatrix_[sGPU][tGPU] = dist[t];
+            if (sGPU != tGPU && topology_.connected(sGPU, tGPU)) {
+                distanceMatrix_[sGPU][tGPU] = dist[tGPU];
+            }
         }
         
-        // Only reconstruct and store routes to direct neighbors
+        // Reconstruct routes only for direct neighbors
         for (int tGPU : directDeviceNeighbors_[sGPU]) {
-            const int t = tGPU;
-            routes_[sGPU][tGPU] = reconstruct(s, t, prev);
+            routes_[sGPU][tGPU] = reconstruct(s, tGPU, prev);
         }
     }
 }
@@ -491,10 +521,12 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
 bool TimeExpandedNetwork::swCapOkAt_(const int sid, const Time s, const Time e, const bool isIn) const noexcept {
     const auto& vec = isIn ? swInUse_[sid] : swOutUse_[sid];
     const int cap = isIn ? swInCap_[sid] : swOutCap_[sid];
-    // count overlaps in [s,e)
+    constexpr Time epsilon = 1e-9;
+    
     int overlap = 0;
     for (const auto& itv : vec) {
-        if (!(e <= itv.s || s >= itv.e)) { // overlap
+        bool noOverlap = (e < itv.s + epsilon) || (s > itv.e - epsilon);
+        if (!noOverlap) {
             ++overlap;
             if (overlap >= cap) return false;
         }
@@ -504,59 +536,128 @@ bool TimeExpandedNetwork::swCapOkAt_(const int sid, const Time s, const Time e, 
 
 void TimeExpandedNetwork::swReserve_(const int sid, const Time s, const Time e, const bool isIn) noexcept {
     auto& vec = isIn ? swInUse_[sid] : swOutUse_[sid];
-    vec.push_back({s,e});
+    
+    // Optimization: merge with adjacent/overlapping intervals to prevent unbounded growth
+    constexpr Time epsilon = 1e-9;
+    bool merged = false;
+    
+    for (auto& itv : vec) {
+        // Check if new interval [s,e] can merge with existing interval itv
+        // Merge if: new interval starts before/at existing end, and ends after/at existing start
+        if (s <= itv.e + epsilon && e >= itv.s - epsilon) {
+            itv.s = std::min(itv.s, s);
+            itv.e = std::max(itv.e, e);
+            merged = true;
+            break;
+        }
+    }
+    
+    if (!merged) {
+        vec.push_back({s, e});
+    }
+    
+    // Periodically clean up old intervals (before currentTime_) to prevent memory growth
+    // Only clean every ~1000 reservations to avoid excessive overhead
+    static int cleanupCounter = 0;
+    if (++cleanupCounter >= 1000) {
+        cleanupCounter = 0;
+        auto it = std::remove_if(vec.begin(), vec.end(), 
+            [this](const Interval& itv) { return itv.e < this->currentTime_; });
+        vec.erase(it, vec.end());
+    }
 }
 
 bool TimeExpandedNetwork::canReserveRoute_(const Route& r, const Time t0) const noexcept {
     if (r.nodes.size() < 2) return false;
+    
     Time t = t0;
-    for (size_t i = 1; i < r.nodes.size(); ++i) {
+    size_t i = 1;
+    
+    while (i < r.nodes.size()) {
         int u = r.nodes[i-1], v = r.nodes[i];
         const Time d = r.deltas[i-1];
-        // link must be free at t
-        if (!hasEdge_[u][v]) return false;
-        if (edgeBusyUntil_[u][v] > t) {
-            // Edge is busy - route cannot be reserved
-            return false;
+        
+        // Check for CUT_THROUGH switch
+        int switchId = topology_.switchIdFromNode(v);
+        bool isCutThrough = (switchId >= 0 && i + 1 < r.nodes.size() && 
+                             topology_.switchAt(switchId).forwardingMode == SwitchForwardingMode::CUT_THROUGH);
+        
+        if (isCutThrough) {
+            int w = r.nodes[i + 1];
+            const Time d2 = r.deltas[i];
+            
+            // Both edges must be free
+            if (!hasEdge_[u][v] || !hasEdge_[v][w]) return false;
+            if (edgeBusyUntil_[u][v] > t || edgeBusyUntil_[v][w] > t) return false;
+            
+            // Switch capacity for pipelined transmission
+            Time maxDuration = std::max(d, d2);
+            if (!swCapOkAt_(switchId, t, t + maxDuration, true)) return false;
+            if (!swCapOkAt_(switchId, t, t + maxDuration, false)) return false;
+            
+            t += maxDuration;
+            i += 2;
+        } else {
+            // Standard edge
+            if (!hasEdge_[u][v]) return false;
+            if (edgeBusyUntil_[u][v] > t) return false;
+            
+            const int sid_u = topology_.switchIdFromNode(u);
+            const int sid_v = topology_.switchIdFromNode(v);
+            if (sid_u >= 0 && !swCapOkAt_(sid_u, t, t + d, false)) return false;
+            if (sid_v >= 0 && !swCapOkAt_(sid_v, t, t + d, true)) return false;
+            
+            t += d;
+            i += 1;
         }
-        // OPTIMIZATION: Removed roundUsedEdges check to allow edge reuse at different times
-        // The edgeBusyUntil check above already prevents actual time conflicts
-        // Removing this constraint increases parallelism significantly
-        // if (roundUsedEdges_[u][v]) {
-        //     return false;
-        // }
-        // switch caps at u/v if they are switches
-        const int sid_u = topology_.switchIdFromNode(u);
-        const int sid_v = topology_.switchIdFromNode(v);
-        // entering v (if v is switch) consumes its IN; leaving u (if u is switch) consumes its OUT
-        if (sid_u >= 0) { // leaving switch u
-            if (!swCapOkAt_(sid_u, t, t + d, /*isIn=*/false)) return false;
-        }
-        if (sid_v >= 0) { // entering switch v
-            if (!swCapOkAt_(sid_v, t, t + d, /*isIn=*/true)) return false;
-        }
-        t += d;
     }
     return true;
 }
 
 void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept {
+    if (r.nodes.size() < 2) return;
+    
     Time t = t0;
-    for (size_t i = 1; i < r.nodes.size(); ++i) {
+    size_t i = 1;
+    
+    while (i < r.nodes.size()) {
         int u = r.nodes[i-1], v = r.nodes[i];
         const Time d = r.deltas[i-1];
-        // mark edge busy
-        edgeBusyUntil_[u][v] = t + d;
-        // Accumulate busy time for this physical edge
-        edgeAccumulatedBusyTime_[u][v] += d;
-        // OPTIMIZATION: No longer marking roundUsedEdges since we removed the constraint
-        // roundUsedEdges_[u][v] = 1;
-        // switch caps
-        const int sid_u = topology_.switchIdFromNode(u);
-        const int sid_v = topology_.switchIdFromNode(v);
-        if (sid_u >= 0) swReserve_(sid_u, t, t + d, /*isIn=*/false);
-        if (sid_v >= 0) swReserve_(sid_v, t, t + d, /*isIn=*/true);
-        t += d;
+        
+        // Check for CUT_THROUGH switch
+        int switchId = topology_.switchIdFromNode(v);
+        bool isCutThrough = (switchId >= 0 && i + 1 < r.nodes.size() && 
+                             topology_.switchAt(switchId).forwardingMode == SwitchForwardingMode::CUT_THROUGH);
+        
+        if (isCutThrough) {
+            int w = r.nodes[i + 1];
+            const Time d2 = r.deltas[i];
+            
+            // Pipelined: both edges active simultaneously
+            edgeBusyUntil_[u][v] = t + d;
+            edgeBusyUntil_[v][w] = t + d2;
+            edgeAccumulatedBusyTime_[u][v] += d;
+            edgeAccumulatedBusyTime_[v][w] += d2;
+            
+            Time maxDuration = std::max(d, d2);
+            swReserve_(switchId, t, t + maxDuration, true);
+            swReserve_(switchId, t, t + maxDuration, false);
+            
+            t += maxDuration;
+            i += 2;
+        } else {
+            // Standard edge
+            edgeBusyUntil_[u][v] = t + d;
+            edgeAccumulatedBusyTime_[u][v] += d;
+            
+            const int sid_u = topology_.switchIdFromNode(u);
+            const int sid_v = topology_.switchIdFromNode(v);
+            if (sid_u >= 0) swReserve_(sid_u, t, t + d, false);
+            if (sid_v >= 0) swReserve_(sid_v, t, t + d, true);
+            
+            t += d;
+            i += 1;
+        }
     }
 }
 
