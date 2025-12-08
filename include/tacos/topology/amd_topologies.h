@@ -21,4 +21,9 @@ void BuildAMD_MI250_2Chassis(Topology& topo, bool allow_copy = false);
 /// @param allow_copy Whether to allow copy operations
 void BuildAMD_MI250_4Chassis(Topology& topo, bool allow_copy = false);
 
+/// @brief Build AMD MI250 two chassis topology (TE-CCL version)
+/// @param topo Topology object to build into
+/// @param allow_copy Whether to allow copy operations
+void BuildAMD_MI250_2Chassis_Tecc(Topology& topo, bool allow_copy = false);
+
 }  // namespace tacos

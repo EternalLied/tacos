@@ -13,7 +13,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 
 namespace tacos {
 
-void BuildDGX1_Tecc(Topology& topo, double alpha_us) {
+void BuildDGX1(Topology& topo, double alpha_us) {
   // TE-CCL DGX1: 8 GPUs, direct GPU-GPU graph, no explicit switch.
   // Each "1" or "2" in the adjacency matrix corresponds to 25 or 50 GB/s.
   const int N = 8;
@@ -43,21 +43,7 @@ void BuildDGX1_Tecc(Topology& topo, double alpha_us) {
   add(6,7,2);
 }
 
-void BuildDGX1_SingleChassis(Topology& topo,
-                             double bw_gbps,
-                             double alpha_us,
-                             bool allow_copy) {
-  const int N = 8;
-  topo.setNpusCount_(N);
-  auto sw = topo.addSwitch("NVSW", allow_copy, /*inCap*/N, /*outCap*/N, 
-                           SwitchForwardingMode::CUT_THROUGH);
-  for (int g = 0; g < N; ++g) {
-    topo.addPhysLink(topo.deviceNode(g), topo.switchNode(sw), bw_gbps, alpha_us);
-    topo.addPhysLink(topo.switchNode(sw), topo.deviceNode(g), bw_gbps, alpha_us);
-  }
-}
-
-void BuildDGX2_TwoChassis_Tecc(Topology& topo, bool allow_copy) {
+void BuildDGX2_TwoChassis(Topology& topo, bool allow_copy) {
   // TE-CCL DGX2 two-chassis (Fig.13): 2*16 GPUs, each chassis has one logical NVSW.
   // Intra-chassis: GPU<->NVSW 125GB/s, alpha=0.35us.
   // Inter-chassis: selected GPU<->GPU edges 12.5GB/s, alpha=2.6us.
@@ -87,15 +73,24 @@ void BuildDGX2_TwoChassis_Tecc(Topology& topo, bool allow_copy) {
 
   // Inter-chassis: GPU->GPU direct links, 12.5GB/s, alpha=2.6us
   // Mapping from teccl_topologies/dgx2.py (taccl map: {"1":[0], "3":[2], ... "15":[14]})
+  // 
+  // EXPERIMENT: Test unidirectional links like Teccl to understand scheduling behavior
+  // In Teccl, the matrix is unidirectional but achieves bidirectional connectivity through
+  // separate iterations. Here we test if TACOS can handle multi-hop routing with unidirectional links.
   std::vector<std::pair<int,int>> pairs = {
     {1,0}, {3,2}, {5,4}, {7,6}, {9,8}, {11,10}, {13,12}, {15,14}
   };
 
-  auto connect_gpu_pair = [&](int gA, int gB) {
-    topo.addPhysLink(topo.deviceNode(gA), topo.deviceNode(gB),
-                     12.5, 2.6);
-    topo.addPhysLink(topo.deviceNode(gB), topo.deviceNode(gA),
-                     12.5, 2.6);
+  // Test 1: Bidirectional (original TACOS approach) - UNCOMMENT to enable
+  auto connect_gpu_pair_bidirectional = [&](int gA, int gB) {
+    topo.addPhysLink(topo.deviceNode(gA), topo.deviceNode(gB), 12.5, 2.6);
+    topo.addPhysLink(topo.deviceNode(gB), topo.deviceNode(gA), 12.5, 2.6);
+  };
+
+  // Test 2: Unidirectional (Teccl-style) - UNCOMMENT to enable
+  auto connect_gpu_pair_unidirectional = [&](int gA, int gB) {
+    // Only create gA -> gB direction
+    topo.addPhysLink(topo.deviceNode(gA), topo.deviceNode(gB), 12.5, 2.6);
   };
 
   // chassis 0 GPUs [0..15], chassis 1 GPUs [16..31]
@@ -104,12 +99,48 @@ void BuildDGX2_TwoChassis_Tecc(Topology& topo, bool allow_copy) {
     int r1 = perChGpu + rLocal;    // chassis1 receiver
     int s1 = perChGpu + sLocal;    // chassis1 sender
     int r0 = rLocal;               // chassis0 receiver
-    connect_gpu_pair(s0, r1);
-    connect_gpu_pair(s1, r0);
+    
+    // Test unidirectional links with multi-hop AllGather support
+    connect_gpu_pair_unidirectional(s0, r1);
+    connect_gpu_pair_unidirectional(s1, r0);
   }
 }
 
-void BuildDGX2_TwoChassis(Topology& topo, bool allow_copy) {
+void BuildDGX2_TwoChassis_typeA(Topology& topo, bool allow_copy) {
+  const int perChGpu = 16;
+  const int totalGpu = 2 * perChGpu;
+  topo.setNpusCount_(totalGpu);
+  
+  // Two chassis NVSwitch blocks (Cut-Through, for intra-chassis)
+  auto swA = topo.addSwitch("NVSW_A", allow_copy, perChGpu, perChGpu, 
+                            SwitchForwardingMode::CUT_THROUGH);
+  auto swB = topo.addSwitch("NVSW_B", allow_copy, perChGpu, perChGpu, 
+                            SwitchForwardingMode::CUT_THROUGH);
+  
+  // Single shared IB switch connecting all 32 GPUs (16 ports, CUT_THROUGH)
+  // This models a centralized inter-chassis switch with 16 concurrent connections
+  auto ibShared = topo.addSwitch("IB_Shared", /*allow_copy*/false, /*in*/16, /*out*/16, 
+                                 SwitchForwardingMode::CUT_THROUGH);
+
+  // Intra-chassis: GPU<->NVSW 125 GB/s α=0.35us
+  for (int g = 0; g < perChGpu; ++g) {
+    topo.addPhysLink(topo.deviceNode(g), topo.switchNode(swA), 125.0, 0.35);
+    topo.addPhysLink(topo.switchNode(swA), topo.deviceNode(g), 125.0, 0.35);
+  }
+  for (int g = 0; g < perChGpu; ++g) {
+    const int id = perChGpu + g;
+    topo.addPhysLink(topo.deviceNode(id), topo.switchNode(swB), 125.0, 0.35);
+    topo.addPhysLink(topo.switchNode(swB), topo.deviceNode(id), 125.0, 0.35);
+  }
+  
+  // Inter-chassis: All GPUs connect to shared IB switch, 12.5 GB/s α=2.6us
+  for (int g = 0; g < totalGpu; ++g) {
+    topo.addPhysLink(topo.deviceNode(g), topo.switchNode(ibShared), 12.5, 2.60);
+    topo.addPhysLink(topo.switchNode(ibShared), topo.deviceNode(g), 12.5, 2.60);
+  }
+}
+
+void BuildDGX2_TwoChassis_typeB(Topology& topo, bool allow_copy) {
   const int perChGpu = 16;
   topo.setNpusCount_(2*perChGpu);
   // two chassis NVSwitch blocks (Cut-Through)
@@ -117,25 +148,45 @@ void BuildDGX2_TwoChassis(Topology& topo, bool allow_copy) {
                             SwitchForwardingMode::CUT_THROUGH);
   auto swB = topo.addSwitch("NVSW_B", allow_copy, perChGpu, perChGpu, 
                             SwitchForwardingMode::CUT_THROUGH);
-  // core/aggregation switch (IB, Store-and-Forward)
-  auto core = topo.addSwitch("CORE", /*allow_copy*/false, /*in*/8, /*out*/8, 
-                             SwitchForwardingMode::STORE_AND_FORWARD);
+  
+  // Two IB switches for inter-chassis (one per chassis, 8 ports each)
+  // Using CUT_THROUGH mode for IB switches as requested
+  auto ibA = topo.addSwitch("IB_A", /*allow_copy*/false, /*in*/8, /*out*/8, 
+                            SwitchForwardingMode::CUT_THROUGH);
+  auto ibB = topo.addSwitch("IB_B", /*allow_copy*/false, /*in*/8, /*out*/8, 
+                            SwitchForwardingMode::CUT_THROUGH);
 
-  // Intra-chassis: GPU<->NVSW 125 GB/s α=0.35us  (TE-CCL Fig.13)
+  // Intra-chassis: GPU<->NVSW 125 GB/s α=0.35us
   for (int g = 0; g < perChGpu; ++g) {
-    topo.addPhysLink(topo.deviceNode(g),               topo.switchNode(swA), 125.0, 0.35);
-    topo.addPhysLink(topo.switchNode(swA), topo.deviceNode(g),               125.0, 0.35);
+    topo.addPhysLink(topo.deviceNode(g), topo.switchNode(swA), 125.0, 0.35);
+    topo.addPhysLink(topo.switchNode(swA), topo.deviceNode(g), 125.0, 0.35);
   }
   for (int g = 0; g < perChGpu; ++g) {
     const int id = perChGpu + g;
-    topo.addPhysLink(topo.deviceNode(id),              topo.switchNode(swB), 125.0, 0.35);
-    topo.addPhysLink(topo.switchNode(swB), topo.deviceNode(id),              125.0, 0.35);
+    topo.addPhysLink(topo.deviceNode(id), topo.switchNode(swB), 125.0, 0.35);
+    topo.addPhysLink(topo.switchNode(swB), topo.deviceNode(id), 125.0, 0.35);
   }
-  // Inter-chassis via core: 100 GB/s α=2.6us (both directions)
-  topo.addPhysLink(topo.switchNode(swA), topo.switchNode(core), 100, 2.60);
-  topo.addPhysLink(topo.switchNode(core),topo.switchNode(swA),  100, 2.60);
-  topo.addPhysLink(topo.switchNode(swB), topo.switchNode(core), 100, 2.60);
-  topo.addPhysLink(topo.switchNode(core),topo.switchNode(swB),  100, 2.60);
+  
+  // Inter-chassis: GPU<->IB connections, 12.5 GB/s α=2.6us
+  // Chassis A GPUs connect to IB_A
+  for (int g = 0; g < perChGpu; ++g) {
+    topo.addPhysLink(topo.deviceNode(g), topo.switchNode(ibA), 12.5, 2.60);
+    topo.addPhysLink(topo.switchNode(ibA), topo.deviceNode(g), 12.5, 2.60);
+  }
+  // Chassis B GPUs connect to IB_B
+  for (int g = 0; g < perChGpu; ++g) {
+    const int id = perChGpu + g;
+    topo.addPhysLink(topo.deviceNode(id), topo.switchNode(ibB), 12.5, 2.60);
+    topo.addPhysLink(topo.switchNode(ibB), topo.deviceNode(id), 12.5, 2.60);
+  }
+  
+  // IB switches interconnection: 8 parallel bidirectional links (12.5 GB/s each)
+  // This allows true concurrent transmission across multiple physical links
+  // Total aggregate bandwidth: 8 × 12.5 = 100 GB/s per direction
+  for (int i = 0; i < 8; ++i) {
+    topo.addPhysLink(topo.switchNode(ibA), topo.switchNode(ibB), 12.5, 2.60);
+    topo.addPhysLink(topo.switchNode(ibB), topo.switchNode(ibA), 12.5, 2.60);
+  }
 }
 
 }  // namespace tacos

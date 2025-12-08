@@ -150,10 +150,11 @@ class TimeExpandedNetwork {
 
     // ===== Multi-switch physical resources =====
     struct EdgeKey { int u; int v; };
-    // busy-until on physical directed edges (device/switch graph)
-    std::vector<std::vector<Time>> edgeBusyUntil_; // sized [totalNodes_][totalNodes_], -1 if no edge
-    std::vector<std::vector<Time>> edgeDelta_;     // per-edge α+β·n (μs); -1 if no edge
-    std::vector<std::vector<char>> hasEdge_;       // quick check
+    // Support for multiple parallel physical links between same (u,v) pair
+    // Each parallel link has independent busy-until time and delta
+    std::vector<std::vector<std::vector<Time>>> edgeBusyUntil_; // [u][v][link_idx]
+    std::vector<std::vector<std::vector<Time>>> edgeDelta_;     // [u][v][link_idx]
+    std::vector<std::vector<int>> edgeCount_;                   // [u][v] = number of parallel links
     
     // Physical edge utilization tracking (for statistics)
     std::vector<std::vector<Time>> edgeAccumulatedBusyTime_; // total busy time for utilization stats

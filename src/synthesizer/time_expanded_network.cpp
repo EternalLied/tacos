@@ -24,10 +24,8 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     npusCount_ = topology_.npusCount();
     totalNodes_ = topology_.totalNodes();
 
-    // physical graph resources
-    edgeBusyUntil_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
-    edgeDelta_.assign(totalNodes_, std::vector<Time>(totalNodes_, -1));
-    hasEdge_.assign(totalNodes_, std::vector<char>(totalNodes_, 0));
+    // physical graph resources (will be properly initialized in computeEdgeTimes_)
+    edgeCount_.assign(totalNodes_, std::vector<int>(totalNodes_, 0));
     edgeAccumulatedBusyTime_.assign(totalNodes_, std::vector<Time>(totalNodes_, 0));
 
     // per-switch caps & calendars
@@ -236,21 +234,38 @@ TimeExpandedNetwork::getArrivalsAt(Time time) noexcept {
 
 // ===== helpers =====
 void TimeExpandedNetwork::computeEdgeTimes_(const ChunkSize chunkSize) noexcept {
-    // init to no-edge
-    for (int u = 0; u < totalNodes_; ++u)
-      for (int v = 0; v < totalNodes_; ++v) {
-        edgeBusyUntil_[u][v] = -1;
-        edgeDelta_[u][v] = -1;
-        hasEdge_[u][v] = 0;
-      }
-    // fill from topology.physLinks
+    // Initialize edge count matrix
+    edgeCount_.assign(totalNodes_, std::vector<int>(totalNodes_, 0));
+    
+    // First pass: count parallel links between each (u,v) pair
+    for (const auto& e : topology_.physLinks()) {
+        edgeCount_[e.src][e.dst]++;
+    }
+    
+    // Resize edge data structures based on parallel link counts
+    edgeBusyUntil_.assign(totalNodes_, std::vector<std::vector<Time>>(totalNodes_));
+    edgeDelta_.assign(totalNodes_, std::vector<std::vector<Time>>(totalNodes_));
+    
+    for (int u = 0; u < totalNodes_; ++u) {
+        for (int v = 0; v < totalNodes_; ++v) {
+            if (edgeCount_[u][v] > 0) {
+                edgeBusyUntil_[u][v].resize(edgeCount_[u][v], -1);
+                edgeDelta_[u][v].resize(edgeCount_[u][v], -1);
+            }
+        }
+    }
+    
+    // Second pass: fill edge parameters for each parallel link
+    std::vector<std::vector<int>> linkIndex(totalNodes_, std::vector<int>(totalNodes_, 0));
+    
     for (const auto& e : topology_.physLinks()) {
         const double bwGiB = std::max(1e-12, (double)e.bw);
-        const double beta_us = (double)chunkSize / (bwGiB * 1024.0 * 1024.0 * 1024.0) * 1e6; // GiB/s -> μs
+        const double beta_us = (double)chunkSize / (bwGiB * 1024.0 * 1024.0 * 1024.0) * 1e6;
         const double delta = e.alpha + beta_us;
-        edgeDelta_[e.src][e.dst] = (Time)delta;  // Keep precision, don't round
-        hasEdge_[e.src][e.dst] = 1;
-        edgeBusyUntil_[e.src][e.dst] = -1;
+        
+        int idx = linkIndex[e.src][e.dst]++;
+        edgeDelta_[e.src][e.dst][idx] = (Time)delta;
+        edgeBusyUntil_[e.src][e.dst][idx] = -1;
     }
 }
 
@@ -263,19 +278,20 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
     routes_.assign(npusCount_, std::vector<Route>(npusCount_));
     // Build CUT_THROUGH-aware adjacency: for each u→SW→w path where SW is CUT_THROUGH,
     // add virtual edge u→w with pipelined time = max(d1, d2)
+    // For parallel links, use the first link's delta (all parallel links have same parameters)
     std::vector<std::vector<std::pair<int, Time>>> adj(N);
     for (int u = 0; u < N; ++u) {
-        for (int v = 0; v < N; ++v) if (hasEdge_[u][v]) {
+        for (int v = 0; v < N; ++v) if (edgeCount_[u][v] > 0) {
             int sid = topology_.switchIdFromNode(v);
             if (sid >= 0 && topology_.switchAt(sid).forwardingMode == SwitchForwardingMode::CUT_THROUGH) {
                 // v is CUT_THROUGH switch: add virtual edges u→w for all neighbors w of v
-                for (int w = 0; w < N; ++w) if (hasEdge_[v][w] && w != u) {
-                    Time pipel = std::max(edgeDelta_[u][v], edgeDelta_[v][w]);
+                for (int w = 0; w < N; ++w) if (edgeCount_[v][w] > 0 && w != u) {
+                    Time pipel = std::max(edgeDelta_[u][v][0], edgeDelta_[v][w][0]);
                     adj[u].push_back({w, pipel});
                 }
             } else {
                 // Not a CUT_THROUGH switch or regular node: add physical edge
-                adj[u].push_back({v, edgeDelta_[u][v]});
+                adj[u].push_back({v, edgeDelta_[u][v][0]});
             }
         }
     }
@@ -332,13 +348,13 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
                 } else {
                     // Store-and-forward switch: cumulative transmission
                     // Process first edge (u → v)
-                    totalTime += edgeDelta_[u][v];
+                    totalTime += edgeDelta_[u][v][0];
                     totalLogicalHops += 1;
                     i += 1;
                 }
             } else {
                 // Not a switch or last edge: cumulative
-                totalTime += edgeDelta_[u][v];
+                totalTime += edgeDelta_[u][v][0];
                 totalLogicalHops += 1;
                 i += 1;
             }
@@ -365,9 +381,9 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
             if (i + 1 < dijkstraPath.size()) {
                 int w = dijkstraPath[i + 1];
                 // If no direct edge u→w, insert CUT_THROUGH switch
-                if (!hasEdge_[u][w]) {
+                if (edgeCount_[u][w] == 0) {
                     for (int sw = npusCount_; sw < totalNodes_; ++sw) {
-                        if (hasEdge_[u][sw] && hasEdge_[sw][w]) {
+                        if (edgeCount_[u][sw] > 0 && edgeCount_[sw][w] > 0) {
                             int sid = topology_.switchIdFromNode(sw);
                             if (sid >= 0 && topology_.switchAt(sid).forwardingMode == SwitchForwardingMode::CUT_THROUGH) {
                                 physicalPath.push_back(sw);
@@ -385,7 +401,7 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
         r.physicalHops = static_cast<int>(physicalPath.size()) - 1;
         
         for (size_t i = 1; i < physicalPath.size(); ++i) {
-            r.deltas.push_back(edgeDelta_[physicalPath[i-1]][physicalPath[i]]);
+            r.deltas.push_back(edgeDelta_[physicalPath[i-1]][physicalPath[i]][0]);
         }
         
         return r;
@@ -400,7 +416,7 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
             bool isDirectNeighbor = false;
             
             // Case 1: Direct device-to-device edge
-            if (hasEdge_[u][v]) {
+            if (edgeCount_[u][v] > 0) {
                 isDirectNeighbor = true;
             }
             // Case 2: Path through switches only (no intermediate devices)
@@ -416,7 +432,7 @@ void TimeExpandedNetwork::computeRoutes_(const ChunkSize chunkSize) noexcept {
                     q.pop();
                     
                     for (int next = 0; next < totalNodes_; ++next) {
-                        if (!hasEdge_[curr][next] || visited[next]) continue;
+                        if (edgeCount_[curr][next] == 0 || visited[next]) continue;
                         
                         if (next == v) {
                             isDirectNeighbor = true;
@@ -548,9 +564,22 @@ bool TimeExpandedNetwork::canReserveRoute_(const Route& r, const Time t0) const 
             int w = r.nodes[i + 1];
             const Time d2 = r.deltas[i];
             
-            // Both edges must be free
-            if (!hasEdge_[u][v] || !hasEdge_[v][w]) return false;
-            if (edgeBusyUntil_[u][v] > t || edgeBusyUntil_[v][w] > t) return false;
+            // Check if at least one parallel link pair is free for both edges
+            if (edgeCount_[u][v] == 0 || edgeCount_[v][w] == 0) return false;
+            
+            bool foundFreePair = false;
+            for (int idx1 = 0; idx1 < edgeCount_[u][v]; ++idx1) {
+                if (edgeBusyUntil_[u][v][idx1] <= t) {
+                    for (int idx2 = 0; idx2 < edgeCount_[v][w]; ++idx2) {
+                        if (edgeBusyUntil_[v][w][idx2] <= t) {
+                            foundFreePair = true;
+                            break;
+                        }
+                    }
+                    if (foundFreePair) break;
+                }
+            }
+            if (!foundFreePair) return false;
             
             // Switch capacity for pipelined transmission
             Time maxDuration = std::max(d, d2);
@@ -560,9 +589,17 @@ bool TimeExpandedNetwork::canReserveRoute_(const Route& r, const Time t0) const 
             t += maxDuration;
             i += 2;
         } else {
-            // Standard edge
-            if (!hasEdge_[u][v]) return false;
-            if (edgeBusyUntil_[u][v] > t) return false;
+            // Standard edge: check if any parallel link is free
+            if (edgeCount_[u][v] == 0) return false;
+            
+            bool hasFreeLink = false;
+            for (int idx = 0; idx < edgeCount_[u][v]; ++idx) {
+                if (edgeBusyUntil_[u][v][idx] <= t) {
+                    hasFreeLink = true;
+                    break;
+                }
+            }
+            if (!hasFreeLink) return false;
             
             const int sid_u = topology_.switchIdFromNode(u);
             const int sid_v = topology_.switchIdFromNode(v);
@@ -595,11 +632,28 @@ void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept 
             int w = r.nodes[i + 1];
             const Time d2 = r.deltas[i];
             
-            // Pipelined: both edges active simultaneously
-            edgeBusyUntil_[u][v] = t + d;
-            edgeBusyUntil_[v][w] = t + d2;
-            edgeAccumulatedBusyTime_[u][v] += d;
-            edgeAccumulatedBusyTime_[v][w] += d2;
+            // Find the earliest available parallel link pair
+            int bestIdx1 = -1, bestIdx2 = -1;
+            for (int idx1 = 0; idx1 < edgeCount_[u][v]; ++idx1) {
+                if (edgeBusyUntil_[u][v][idx1] <= t) {
+                    for (int idx2 = 0; idx2 < edgeCount_[v][w]; ++idx2) {
+                        if (edgeBusyUntil_[v][w][idx2] <= t) {
+                            bestIdx1 = idx1;
+                            bestIdx2 = idx2;
+                            break;
+                        }
+                    }
+                    if (bestIdx1 >= 0) break;
+                }
+            }
+            
+            // Reserve the selected parallel links
+            if (bestIdx1 >= 0 && bestIdx2 >= 0) {
+                edgeBusyUntil_[u][v][bestIdx1] = t + d;
+                edgeBusyUntil_[v][w][bestIdx2] = t + d2;
+                edgeAccumulatedBusyTime_[u][v] += d;
+                edgeAccumulatedBusyTime_[v][w] += d2;
+            }
             
             Time maxDuration = std::max(d, d2);
             swReserve_(switchId, t, t + maxDuration, true);
@@ -608,9 +662,20 @@ void TimeExpandedNetwork::reserveRoute_(const Route& r, const Time t0) noexcept 
             t += maxDuration;
             i += 2;
         } else {
-            // Standard edge
-            edgeBusyUntil_[u][v] = t + d;
-            edgeAccumulatedBusyTime_[u][v] += d;
+            // Standard edge: find earliest available parallel link
+            int bestIdx = -1;
+            for (int idx = 0; idx < edgeCount_[u][v]; ++idx) {
+                if (edgeBusyUntil_[u][v][idx] <= t) {
+                    bestIdx = idx;
+                    break;
+                }
+            }
+            
+            // Reserve the selected parallel link
+            if (bestIdx >= 0) {
+                edgeBusyUntil_[u][v][bestIdx] = t + d;
+                edgeAccumulatedBusyTime_[u][v] += d;
+            }
             
             const int sid_u = topology_.switchIdFromNode(u);
             const int sid_v = topology_.switchIdFromNode(v);

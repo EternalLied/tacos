@@ -47,37 +47,30 @@ std::optional<Topology> createTopology(const std::string& topologyName) {
         }},
         
         // DGX1 TE-CCL (8 GPUs, direct GPU-GPU graph)
-        {"DGX1_Tecc", []() {
+        {"DGX1", []() {
             Topology topo;
-            BuildDGX1_Tecc(topo, /*alpha_us*/0.7);
-            return topo;
-        }},
-        
-        // DGX1 Single Chassis
-        {"DGX1_1", []() {
-            Topology topo;
-            BuildDGX1_SingleChassis(topo, /*bw_gbps*/125.0, /*alpha_us*/0.35, /*allow_copy*/false);
+            BuildDGX1(topo, /*alpha_us*/0.7);
             return topo;
         }},
         
         // DGX2 Two Chassis TE-CCL
-        {"DGX2_2_Tecc", []() {
-            Topology topo;
-            BuildDGX2_TwoChassis_Tecc(topo, /*allow_copy*/false);
-            return topo;
-        }},
-        
-        // DGX2 Two Chassis
         {"DGX2_2", []() {
             Topology topo;
             BuildDGX2_TwoChassis(topo, /*allow_copy*/false);
             return topo;
         }},
         
-        // NDv2 Two Chassis TE-CCL
-        {"NDv2_2_Tecc", []() {
+        // DGX2 Two Chassis Type A (single shared IB switch, 16 ports)
+        {"DGX2_2_A", []() {
             Topology topo;
-            BuildNDv2_TwoChassis_Tecc(topo);
+            BuildDGX2_TwoChassis_typeA(topo, /*allow_copy*/false);
+            return topo;
+        }},
+        
+        // DGX2 Two Chassis Type B (dual IB switches, 8 ports each)
+        {"DGX2_2_B", []() {
+            Topology topo;
+            BuildDGX2_TwoChassis_typeB(topo, /*allow_copy*/false);
             return topo;
         }},
         
@@ -85,13 +78,6 @@ std::optional<Topology> createTopology(const std::string& topologyName) {
         {"NDv2_2", []() {
             Topology topo;
             BuildNDv2_TwoChassis(topo, /*allow_copy*/false);
-            return topo;
-        }},
-        
-        // NDv2 Four Chassis TE-CCL
-        {"NDv2_4_Tecc", []() {
-            Topology topo;
-            BuildNDv2_FourChassis_Tecc(topo, /*allow_copy*/false);
             return topo;
         }},
         
@@ -114,6 +100,13 @@ std::optional<Topology> createTopology(const std::string& topologyName) {
             Topology topo;
             BuildAMD_MI250_4Chassis(topo, /*allow_copy*/false);
             return topo;
+        }},
+        
+        // AMD MI250 Two Chassis TE-CCL
+        {"AMD_2_Tecc", []() {
+            Topology topo;
+            BuildAMD_MI250_2Chassis_Tecc(topo, /*allow_copy*/false);
+            return topo;
         }}
     };
     
@@ -133,12 +126,15 @@ std::optional<Topology> createTopology(const std::string& topologyName) {
 
 std::string getAvailableTopologies() {
     static const std::vector<std::string> topologies = {
-        "mesh2d", "switch_clique", 
-        "DGX1_Tecc", "DGX1_1", 
-        "DGX2_2_Tecc", "DGX2_2", 
-        "NDv2_2_Tecc", "NDv2_2", 
-        "NDv2_4_Tecc", "NDv2_4", 
-        "AMD_2", "AMD_4"
+        "switch_clique", 
+        "mesh2d", 
+        "DGX1_1", 
+        "DGX2_2", 
+        "NDv2_2", 
+        "NDv2_4", 
+        "AMD_2", 
+        "AMD_4",
+        "AMD_2_Tecc"
     };
     
     std::ostringstream oss;

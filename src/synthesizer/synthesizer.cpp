@@ -610,9 +610,11 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexc
         }
 
         // AllGather: only consider direct neighbors (single-hop without crossing devices)
+        // EXPERIMENT: Temporarily disable direct neighbor restriction to test multi-hop routing
         if (collectiveType_ == CollectiveType::ALL_GATHER) {
             if (directNeighbors.count(src) == 0) {
-                continue;  // not a direct neighbor
+                // Allow multi-hop routing for sparse topologies
+                // continue;  // not a direct neighbor
             }
         }
 
