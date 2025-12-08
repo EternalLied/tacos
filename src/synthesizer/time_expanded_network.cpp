@@ -46,6 +46,18 @@ TimeExpandedNetwork::TimeExpandedNetwork(const Topology& topology,
     }
     swInUse_.assign(topology_.switchesCount(), {});
     swOutUse_.assign(topology_.switchesCount(), {});
+    swInUseInsertCount_.assign(topology_.switchesCount(), 0);
+    swOutUseInsertCount_.assign(topology_.switchesCount(), 0);
+
+    // Adaptive cleanup threshold based on topology scale (linear growth)
+    // Formula: max(200, npusCount_ * 20)
+    // Analysis for switch_clique with N GPUs and K≤10 blocks:
+    // - Theoretical max: N × (N-1) × K × 2 ≈ 20N(N-1)
+    // - With concurrency and cleanup: peak ≈ 2N² to 6N²
+    // - Empirical peaks (K≤10): 8→112-336, 16→480-1440, 32−2k-6k, 64−8k-24k, 128→33k-98k
+    // - Linear threshold N×20: triggers cleanup every N×20 insertions per switch direction
+    // - Cleanup based on insertion count (not vec.size) ensures memory is always bounded
+    swCleanupThreshold_ = std::max(size_t(200), size_t(npusCount_ * 20));
 
     // per-edge Δ & GPU->GPU最短路
     computeEdgeTimes_(chunkSize);
@@ -537,30 +549,17 @@ bool TimeExpandedNetwork::swCapOkAt_(const int sid, const Time s, const Time e, 
 void TimeExpandedNetwork::swReserve_(const int sid, const Time s, const Time e, const bool isIn) noexcept {
     auto& vec = isIn ? swInUse_[sid] : swOutUse_[sid];
     
-    // Optimization: merge with adjacent/overlapping intervals to prevent unbounded growth
-    constexpr Time epsilon = 1e-9;
-    bool merged = false;
+    // Simply append the new interval
+    vec.push_back({s, e});
     
-    for (auto& itv : vec) {
-        // Check if new interval [s,e] can merge with existing interval itv
-        // Merge if: new interval starts before/at existing end, and ends after/at existing start
-        if (s <= itv.e + epsilon && e >= itv.s - epsilon) {
-            itv.s = std::min(itv.s, s);
-            itv.e = std::max(itv.e, e);
-            merged = true;
-            break;
-        }
-    }
-    
-    if (!merged) {
-        vec.push_back({s, e});
-    }
-    
-    // Periodically clean up old intervals (before currentTime_) to prevent memory growth
-    // Only clean every ~1000 reservations to avoid excessive overhead
-    static int cleanupCounter = 0;
-    if (++cleanupCounter >= 1000) {
-        cleanupCounter = 0;
+    // Periodically clean up expired intervals based on insertion count
+    // This ensures cleanup happens regardless of the ratio of expired/active intervals
+    // and guarantees memory is bounded by swCleanupThreshold_ insertions worth of data
+    size_t& insertCount = isIn ? swInUseInsertCount_[sid] : swOutUseInsertCount_[sid];
+    if (++insertCount >= swCleanupThreshold_) {
+        insertCount = 0;  // Reset counter after cleanup
+        
+        // Remove all expired intervals (those that ended before current time)
         auto it = std::remove_if(vec.begin(), vec.end(), 
             [this](const Interval& itv) { return itv.e < this->currentTime_; });
         vec.erase(it, vec.end());

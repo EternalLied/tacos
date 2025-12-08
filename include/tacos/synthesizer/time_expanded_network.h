@@ -188,6 +188,11 @@ class TimeExpandedNetwork {
     std::vector<int> swInCap_;   // resolved caps
     std::vector<int> swOutCap_;
     std::vector<char> swAllowCopy_;
+    size_t swCleanupThreshold_;  // adaptive threshold for interval cleanup
+    
+    // Track insertion count per switch direction for periodic cleanup
+    std::vector<size_t> swInUseInsertCount_;   // [sid] insertions since last cleanup
+    std::vector<size_t> swOutUseInsertCount_;  // [sid] insertions since last cleanup
 
     // precomputed shortest route for each GPU pair at current chunkSize
     struct Route {
