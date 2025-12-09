@@ -57,6 +57,7 @@ class Synthesizer {
         Time bestCollectiveTime;
         int bestRound;
         int totalRounds;
+        int failedRounds;  // Number of failed synthesis rounds
         double totalSynthesisTime;  // in microseconds
         bool interrupted;
     };
@@ -65,14 +66,14 @@ class Synthesizer {
     /// @param topology Target network topology
     /// @param collective Target collective pattern
     /// @param chunkSize Size of each chunk (in bytes)
-    /// @param maxNoImprovementRounds Stop after this many rounds without improvement
+    /// @param totalRounds Total number of rounds to run
     /// @param interruptFlag Atomic flag to check for user interruption
     /// @return Multi-round synthesis result
     [[nodiscard]] static MultiRoundResult solveMultiRound(
         const Topology& topology,
         const Collective& collective,
         ChunkSize chunkSize,
-        int maxNoImprovementRounds,
+        int totalRounds,
         const std::atomic<bool>& interruptFlag) noexcept;
 
   private:

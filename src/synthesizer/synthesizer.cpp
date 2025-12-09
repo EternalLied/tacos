@@ -769,7 +769,7 @@ Synthesizer::MultiRoundResult Synthesizer::solveMultiRound(
     const Topology& topology,
     const Collective& collective,
     ChunkSize chunkSize,
-    int maxNoImprovementRounds,
+    int totalRounds,
     const std::atomic<bool>& interruptFlag) noexcept {
     
     MultiRoundResult result;
@@ -777,12 +777,11 @@ Synthesizer::MultiRoundResult Synthesizer::solveMultiRound(
     result.bestCollectiveTime = std::numeric_limits<Time>::max();
     result.bestRound = 0;
     result.totalRounds = 0;
+    result.failedRounds = 0;
     result.totalSynthesisTime = 0.0;
     result.interrupted = false;
     
-    int noImprovementCount = 0;
-    
-    while (true) {
+    for (int round = 1; round <= totalRounds; ++round) {
         ++result.totalRounds;
         
         if (interruptFlag.load()) {
@@ -801,19 +800,18 @@ Synthesizer::MultiRoundResult Synthesizer::solveMultiRound(
         auto roundTime = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
         result.totalSynthesisTime += roundTime;
         
+        // Check if synthesis failed (collectiveTime is -1)
+        if (collectiveTime < 0) {
+            result.failedRounds++;
+            // Skip this failed round, don't update best result
+            continue;
+        }
+        
         // Check if this is the best result
         if (collectiveTime < result.bestCollectiveTime) {
             result.bestCollectiveTime = collectiveTime;
             result.bestRound = result.totalRounds;
             result.bestSynthesizer = std::move(synthesizer);
-            noImprovementCount = 0;
-        } else {
-            noImprovementCount++;
-            
-            // Early stopping if no improvement for several rounds
-            if (noImprovementCount >= maxNoImprovementRounds) {
-                break;
-            }
         }
     }
     

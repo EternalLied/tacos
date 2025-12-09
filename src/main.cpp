@@ -95,12 +95,12 @@ int main(int argc, char* argv[]) {
     std::cout.precision(2);
 
     // Parse command line arguments
-    // Usage: tacos <topology> <collective> [data_size] [multi] [max_rounds]
+    // Usage: tacos <topology> <collective> [data_size] [multi] [rounds]
     // Example: tacos DGX2_2 allgather 12MB multi 100
     std::string topologyName = "mesh2d";  // default topology
     std::string collectiveName = "alltoall";  // default collective
     bool enableMultiRound = false;
-    int maxNoImprovementRounds = 10;  // default max rounds without improvement
+    int multiRounds = 10;  // default number of rounds for multi-round synthesis
     int64_t dataSizeBytes = 1024 * (1 << 20);  // default: 1024 MiB
     
     if (argc > 1) {
@@ -131,10 +131,10 @@ int main(int argc, char* argv[]) {
             enableMultiRound = true;
         } else {
             try {
-                maxNoImprovementRounds = std::stoi(argv[4]);
-                if (maxNoImprovementRounds < 1) {
-                    std::cerr << "Warning: Invalid max no-improvement rounds, using default (10)" << std::endl;
-                    maxNoImprovementRounds = 10;
+                multiRounds = std::stoi(argv[4]);
+                if (multiRounds < 1) {
+                    std::cerr << "Warning: Invalid multi-round count, using default (10)" << std::endl;
+                    multiRounds = 10;
                 }
             } catch (...) {
                 std::cerr << "Warning: Invalid argument format '" << argv[4] << "'" << std::endl;
@@ -143,13 +143,13 @@ int main(int argc, char* argv[]) {
     }
     if (argc > 5) {
         try {
-            maxNoImprovementRounds = std::stoi(argv[5]);
-            if (maxNoImprovementRounds < 1) {
-                std::cerr << "Warning: Invalid max no-improvement rounds, using default (10)" << std::endl;
-                maxNoImprovementRounds = 10;
+            multiRounds = std::stoi(argv[5]);
+            if (multiRounds < 1) {
+                std::cerr << "Warning: Invalid multi-round count, using default (10)" << std::endl;
+                multiRounds = 10;
             }
         } catch (...) {
-            std::cerr << "Warning: Invalid max no-improvement rounds format, using default (10)" << std::endl;
+            std::cerr << "Warning: Invalid multi-round count format, using default (10)" << std::endl;
         }
     }
 
@@ -226,13 +226,13 @@ int main(int argc, char* argv[]) {
         std::signal(SIGINT, signalHandler);
         
         std::cout << "\n=== Multi-Round Synthesis Mode ===" << std::endl;
-        std::cout << "Stop after " << maxNoImprovementRounds << " consecutive rounds without improvement" << std::endl;
+        std::cout << "Running " << multiRounds << " rounds" << std::endl;
         std::cout << "(Press Ctrl+C to interrupt and show best result)" << std::endl;
         std::cout << std::endl;
         
         // Run multi-round synthesis
         auto result = Synthesizer::solveMultiRound(topology, *collective, chunkSize, 
-                                                    maxNoImprovementRounds, g_interrupted);
+                                                    multiRounds, g_interrupted);
         
         // Calculate link utilization for best synthesizer
         double linkUtilization = 0.0;
@@ -248,13 +248,22 @@ int main(int argc, char* argv[]) {
         
         std::cout << "=== Multi-Round Synthesis Summary ===" << std::endl;
         std::cout << "Completed rounds: " << result.totalRounds << std::endl;
-        std::cout << "Average synthesis time: " << result.totalSynthesisTime / 1000 / result.totalRounds << " ms" << std::endl;
-        std::cout << "Best collective time: " << result.bestCollectiveTime 
-                  << " us (found at round " << result.bestRound << ")" << std::endl;
-        std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2)
-          << algoBandwidth << " GiB/s" << std::endl;
-        std::cout << "Average link utilization: " << std::fixed << std::setprecision(2) 
-                  << linkUtilization << "%" << std::endl;
+        std::cout << "Failed rounds: " << result.failedRounds << std::endl;
+        std::cout << "Total synthesis time: " << result.totalSynthesisTime / 1000 << " ms" << std::endl;
+        if (result.totalRounds > 0) {
+            std::cout << "Average synthesis time: " << result.totalSynthesisTime / 1000 / result.totalRounds << " ms" << std::endl;
+        }
+        
+        if (result.bestCollectiveTime != std::numeric_limits<Synthesizer::Time>::max()) {
+            std::cout << "Best collective time: " << result.bestCollectiveTime 
+                      << " us (found at round " << result.bestRound << ")" << std::endl;
+            std::cout << "Algorithm bandwidth: " << std::fixed << std::setprecision(2)
+              << algoBandwidth << " GiB/s" << std::endl;
+            std::cout << "Average link utilization: " << std::fixed << std::setprecision(2) 
+                      << linkUtilization << "%" << std::endl;
+        } else {
+            std::cout << "No successful synthesis results" << std::endl;
+        }
         
         if (result.interrupted) {
             std::cout << "(Interrupted by user)" << std::endl;

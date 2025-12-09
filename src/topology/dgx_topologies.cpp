@@ -14,7 +14,7 @@ Copyright (c) 2022-2025 Georgia Institute of Technology
 namespace tacos {
 
 void BuildDGX1(Topology& topo, double alpha_us) {
-  // TE-CCL DGX1: 8 GPUs, direct GPU-GPU graph, no explicit switch.
+  // TE-CCL DGX1: 8 GPUs, direct GPU-GPU graph.
   // Each "1" or "2" in the adjacency matrix corresponds to 25 or 50 GB/s.
   const int N = 8;
   topo.setNpusCount_(N);
@@ -73,21 +73,10 @@ void BuildDGX2_TwoChassis(Topology& topo, bool allow_copy) {
 
   // Inter-chassis: GPU->GPU direct links, 12.5GB/s, alpha=2.6us
   // Mapping from teccl_topologies/dgx2.py (taccl map: {"1":[0], "3":[2], ... "15":[14]})
-  // 
-  // EXPERIMENT: Test unidirectional links like Teccl to understand scheduling behavior
-  // In Teccl, the matrix is unidirectional but achieves bidirectional connectivity through
-  // separate iterations. Here we test if TACOS can handle multi-hop routing with unidirectional links.
   std::vector<std::pair<int,int>> pairs = {
     {1,0}, {3,2}, {5,4}, {7,6}, {9,8}, {11,10}, {13,12}, {15,14}
   };
 
-  // Test 1: Bidirectional (original TACOS approach) - UNCOMMENT to enable
-  auto connect_gpu_pair_bidirectional = [&](int gA, int gB) {
-    topo.addPhysLink(topo.deviceNode(gA), topo.deviceNode(gB), 12.5, 2.6);
-    topo.addPhysLink(topo.deviceNode(gB), topo.deviceNode(gA), 12.5, 2.6);
-  };
-
-  // Test 2: Unidirectional (Teccl-style) - UNCOMMENT to enable
   auto connect_gpu_pair_unidirectional = [&](int gA, int gB) {
     // Only create gA -> gB direction
     topo.addPhysLink(topo.deviceNode(gA), topo.deviceNode(gB), 12.5, 2.6);
@@ -151,9 +140,9 @@ void BuildDGX2_TwoChassis_typeB(Topology& topo, bool allow_copy) {
   
   // Two IB switches for inter-chassis (one per chassis, 8 ports each)
   // Using CUT_THROUGH mode for IB switches as requested
-  auto ibA = topo.addSwitch("IB_A", /*allow_copy*/false, /*in*/8, /*out*/8, 
+  auto ibA = topo.addSwitch("IB_A", /*allow_copy*/false, /*in*/16, /*out*/16, 
                             SwitchForwardingMode::CUT_THROUGH);
-  auto ibB = topo.addSwitch("IB_B", /*allow_copy*/false, /*in*/8, /*out*/8, 
+  auto ibB = topo.addSwitch("IB_B", /*allow_copy*/false, /*in*/16, /*out*/16, 
                             SwitchForwardingMode::CUT_THROUGH);
 
   // Intra-chassis: GPU<->NVSW 125 GB/s α=0.35us

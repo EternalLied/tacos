@@ -93,20 +93,6 @@ std::optional<Topology> createTopology(const std::string& topologyName) {
             Topology topo;
             BuildAMD_MI250_2Chassis(topo, /*allow_copy*/false);
             return topo;
-        }},
-        
-        // AMD MI250 Four Chassis
-        {"AMD_4", []() {
-            Topology topo;
-            BuildAMD_MI250_4Chassis(topo, /*allow_copy*/false);
-            return topo;
-        }},
-        
-        // AMD MI250 Two Chassis TE-CCL
-        {"AMD_2_Tecc", []() {
-            Topology topo;
-            BuildAMD_MI250_2Chassis_Tecc(topo, /*allow_copy*/false);
-            return topo;
         }}
     };
     
