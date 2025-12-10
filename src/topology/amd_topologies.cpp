@@ -54,7 +54,7 @@ void BuildAMD_MI250_2Chassis(Topology& topo, bool allow_copy) {
     for (int s = 0; s < switchPerCh; ++s) {
       smallSwitches[c].push_back(
         topo.addSwitch("SmallSW_C" + std::to_string(c) + "_" + std::to_string(s),
-                      allow_copy, 2, 2,
+                      allow_copy, 3, 3,
                       SwitchForwardingMode::CUT_THROUGH));
     }
   }

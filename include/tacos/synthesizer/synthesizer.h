@@ -116,6 +116,15 @@ class Synthesizer {
     /// @brief Pre-sorted postcondition list (generated once, updated each iteration)
     std::vector<Condition> sortedPostconditions_ = {};
     
+    /// @brief AllToAll-only: Track scheduled postconditions to prevent duplicate scheduling
+    /// Only used for AllToAll collective (AllGather benefits from replacement mechanism)
+    struct ConditionHash {
+        std::size_t operator()(const Condition& c) const noexcept {
+            return std::hash<ChunkID>{}(c.first) ^ (std::hash<NpuID>{}(c.second) << 1);
+        }
+    };
+    std::unordered_set<Condition, ConditionHash> scheduledAllToAllPostconditions_ = {};
+    
     /// @brief Random number generator engine
     std::mt19937 randomEngine{std::random_device{}()};
     

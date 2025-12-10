@@ -111,6 +111,14 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
         // === PHASE 4: Link-Chunk Matching ===
         PerfLog(perfTimer.start());
         for (const auto [chunk, dest] : sortedPostconditions_) {
+            // AllToAll-only: Skip if already scheduled (prevents duplicate scheduling)
+            // AllGather uses replacement mechanism and benefits from re-scheduling
+            if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
+                if (scheduledAllToAllPostconditions_.count({chunk, dest}) > 0) {
+                    continue;  // Already scheduled, skip to prevent duplicate
+                }
+            }
+            
             // linkChunkMatching_ returns the selected source NPU, or -1 if failed
             const auto selectedSrc = linkChunkMatching_(chunk, dest);
             
@@ -119,6 +127,11 @@ Synthesizer::Time Synthesizer::solve(const Topology& topology,
                 auto path = ten_->getRoutePath(selectedSrc, dest);
                 matchedRoutes.push_back({chunk, selectedSrc, dest, path});
                 ++successfulMatchingCount;
+                
+                // AllToAll-only: Mark as scheduled to prevent re-scheduling
+                if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
+                    scheduledAllToAllPostconditions_.insert({chunk, dest});
+                }
             }
         }
         PerfLog(perfTimer.stop(); totalMatchingTime += perfTimer.time());
@@ -489,13 +502,13 @@ std::pair<int, int> Synthesizer::expandTenTimestep_(PostconditionMap* const post
     // Get all chunks that arrive at this timestep
     auto arrivals = ten_->getArrivalsAt(currentTime_);
     
-    // === PHASE 2: Replacement optimization ===
-    // For each arrival, check if we need replacement optimization
+    // === PHASE 2: Process arrivals with replacement optimization (AllGather only) ===
+    // AllToAll does not need replacement since each chunk sends different data to different destinations
     for (const auto& [chunk, src, dest] : arrivals) {
         auto finalChunk = chunk;
         
-        // Check if this chunk has already arrived at dest via another path
-        if (chunkMap_[chunk][dest]) {
+        // AllGather-only: Replacement optimization for duplicate arrivals
+        if (collectiveType_ != CollectiveType::ALL_TO_ALL && chunkMap_[chunk][dest]) {
             // Check if dest is actually a final destination for this chunk
             const auto& postconditions = collective_->postcondition(chunk);
             const bool isActualDestination = std::find(
@@ -532,12 +545,32 @@ std::pair<int, int> Synthesizer::expandTenTimestep_(PostconditionMap* const post
         chunkMap_[finalChunk][dest] = true;
         eventHappened = true;
         
-        // Update postcondition map
-        auto it = postconditionMap->find(dest);
-        if (it != postconditionMap->end()) {
-            it->second.erase(finalChunk);
-            if (it->second.empty()) {
-                postconditionMap->erase(it);
+        // Check if dest is the final destination for this chunk
+        const auto& postconditions = collective_->postcondition(finalChunk);
+        const bool isFinalDestination = std::find(
+            postconditions.begin(),
+            postconditions.end(),
+            dest
+        ) != postconditions.end();
+        
+        if (isFinalDestination) {
+            // This is a final destination - postcondition satisfied
+            // Update postcondition map
+            auto it = postconditionMap->find(dest);
+            if (it != postconditionMap->end()) {
+                it->second.erase(finalChunk);
+                if (it->second.empty()) {
+                    postconditionMap->erase(it);
+                }
+            }
+        }
+        
+        // AllToAll-only: Remove ALL scheduled postconditions for this chunk
+        // because chunk state has changed (either reached final dest or intermediate node)
+        // This allows re-scheduling for next hop in multi-hop routes
+        if (collectiveType_ == CollectiveType::ALL_TO_ALL) {
+            for (const auto& finalDest : postconditions) {
+                scheduledAllToAllPostconditions_.erase({finalChunk, finalDest});
             }
         }
         
@@ -592,9 +625,8 @@ std::optional<Synthesizer::ChunkID> Synthesizer::findReplacementChunk_(
 }
 
 int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexcept {
-    // Candidate selection: prefer earlier lower distance (1st priority), then fewer physical hops (2nd priority)
+    // Candidate selection: prefer earlier lower distance (only priority)
     auto minDistance = std::numeric_limits<Time>::max();
-    auto minHopCount = std::numeric_limits<int>::max();
     std::vector<NpuID> candidates;
 
     // AllGather optimization: pre-filter sources to direct neighbors only
@@ -625,25 +657,15 @@ int Synthesizer::linkChunkMatching_(const ChunkID chunk, const NpuID dest) noexc
 
         const auto distance = ten_->getDistance(src, dest);
 
-        // Priority 1: Earlier distance (lower distance is better)
-        // Priority 2: Fewer physical hops (lower hopCount is better)
+        // Priority: Earlier distance (lower distance is better)
         if (distance < minDistance) {
             // Found a source with lower distance - clear and start new candidate list
             minDistance = distance;
-            minHopCount = hopCount;
             candidates.clear();
             candidates.push_back(src);
         } else if (isEqual(distance, minDistance)) {
-            // Same lower distance - use hop count as tie-breaker
-            if (hopCount < minHopCount) {
-                // Fewer hops with same lower distance - clear and start new candidate list
-                minHopCount = hopCount;
-                candidates.clear();
-                candidates.push_back(src);
-            } else if (hopCount == minHopCount) {
-                // Same lower distance and same hop count - add to candidates
-                candidates.push_back(src);
-            }
+            // Same distance - add to candidates
+            candidates.push_back(src);
         }
     }
 
@@ -679,6 +701,21 @@ bool Synthesizer::isEqual(const Time lhs, const Time rhs) noexcept {
     return std::abs(lhs - rhs) < epsilon;
 }
 
+bool Synthesizer::tryAllGatherRouting_(const ChunkID chunk, const NpuID selectedSrc, const NpuID dest) noexcept {
+    // Check if precomputed route is available
+    if (!ten_->canReserveRoute(selectedSrc, dest)) {
+        return false;  // Route not available
+    }
+    
+    // Reserve and schedule the direct transfer
+    const auto transferArrivalTime = currentTime_ + ten_->getDistance(selectedSrc, dest);
+    ten_->transferChunk(selectedSrc, dest, chunk, transferArrivalTime);
+    eventQueue_.schedule(transferArrivalTime);
+    // Chunk arrival will be marked in expandTenTimestep_() when the event fires
+    
+    return true;
+}
+
 bool Synthesizer::tryAllToAllRouting_(const ChunkID chunk, const NpuID selectedSrc, const NpuID dest) noexcept {
     // Find best available next hop using greedy algorithm with route availability check
     const int greedyNextHop = ten_->findNextHopGreedy(selectedSrc, dest, currentTime_);
@@ -710,21 +747,6 @@ bool Synthesizer::tryAllToAllRouting_(const ChunkID chunk, const NpuID selectedS
     
     // Dynamically adjust priority since chunk state changed (moved to intermediate node)
     adjustPostconditionPriority_(chunk, dest);
-    
-    return true;
-}
-
-bool Synthesizer::tryAllGatherRouting_(const ChunkID chunk, const NpuID selectedSrc, const NpuID dest) noexcept {
-    // Check if precomputed route is available
-    if (!ten_->canReserveRoute(selectedSrc, dest)) {
-        return false;  // Route not available
-    }
-    
-    // Reserve and schedule the direct transfer
-    const auto transferArrivalTime = currentTime_ + ten_->getDistance(selectedSrc, dest);
-    ten_->transferChunk(selectedSrc, dest, chunk, transferArrivalTime);
-    eventQueue_.schedule(transferArrivalTime);
-    // Chunk arrival will be marked in expandTenTimestep_() when the event fires
     
     return true;
 }
